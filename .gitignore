@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+users.json
+schedules.json
+form-answers.json
+form-page.html
+*.log
+playwright-report/
+test-results/
+.playwright/
+.ruff_cache/
+*.pid

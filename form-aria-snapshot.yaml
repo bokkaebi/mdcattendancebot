@@ -1,0 +1,94 @@
+- text: A Singapore Government Agency Website. Beware of government impersonation scams.
+- button "Expand masthead to find out how to identify an official government website": How to identify
+- img "Logo for Ministry of Defence"
+- banner:
+  - heading "MDC Attendance Form" [level=1]
+  - paragraph: 1 min estimated time to complete
+  - button "Log out": T0774779E - Log out
+- navigation "Jump to form section":
+  - list "List of form section links":
+    - listitem:
+      - 'button "Navigate to section: Instructions"'
+- heading "Instructions" [level=2]
+- paragraph: This form is for all MDC NSFs. This form is monitored by MCO personnel. All attendance to be submitted before 0900hrs on working days.
+- list:
+  - listitem: Deployments and Leaves can be submitted the day before.
+- paragraph: Any submissions beyond 0900hrs will be considered late. Any erroneous submission will be subject to discipline action.
+- group:
+  - text: 1.Name
+  - textbox "1. Name" [disabled]: LI RUN
+- group:
+  - text: 2.Department
+  - radiogroup "2. Department":
+    - radio "Artiste"
+    - text: Artiste
+    - radio "Music"
+    - text: Music
+    - radio "Show Production (Including SDE Cap Devt)"
+    - text: Show Production (Including SDE Cap Devt)
+    - radio "Wardrobe"
+    - text: Wardrobe
+    - radio "Others"
+    - text: Others
+- group:
+  - text: 3.Status
+  - paragraph:
+    - strong: Other Deployments
+    - text: status is for deployments
+    - strong: not held in IS
+    - text: e.g. BMTC Tekong setup/rehearsal @ Tekong
+  - radiogroup "3. Status":
+    - radio "Present (Nee Soon Camp - NSC)"
+    - text: Present (Nee Soon Camp - NSC)
+    - radio "Present (Infinite Studios - IS)"
+    - text: Present (Infinite Studios - IS)
+    - radio "Deployment (Actual Show Day)"
+    - text: Deployment (Actual Show Day)
+    - radio "Other Deployments (Not NSC or IS)"
+    - text: Other Deployments (Not NSC or IS)
+    - radio "Medical Appointment (MA)"
+    - text: Medical Appointment (MA)
+    - radio "Medical Certificate (MC)"
+    - text: Medical Certificate (MC)
+    - radio "Hospitalisation Leave (HL)"
+    - text: Hospitalisation Leave (HL)
+    - radio "Annual Leave"
+    - text: Annual Leave
+    - radio "Overseas Leave"
+    - text: Overseas Leave
+    - radio "OIL/PHIL"
+    - text: OIL/PHIL
+    - radio "Birthday Off"
+    - text: Birthday Off
+    - radio "Work-from-Home (WFH)"
+    - text: Work-from-Home (WFH)
+- button "End of form. Submit now"
+- button "issue feedback"
+- iframe
+- contentinfo:
+  - link "Link to application homepage":
+    - /url: https://form.gov.sg
+    - img
+  - separator
+  - link "Open Government Products homepage":
+    - /url: https://open.gov.sg
+    - img
+  - list:
+    - listitem:
+      - link "Guide":
+        - /url: https://go.gov.sg/formsg-guides
+    - listitem:
+      - link "Privacy":
+        - /url: /privacy
+    - listitem:
+      - link "Terms of use":
+        - /url: /terms
+    - listitem:
+      - link "Report vulnerability":
+        - /url: https://go.gov.sg/report-vulnerability
+- region "Notifications-top"
+- region "Notifications-top-left"
+- region "Notifications-top-right"
+- region "Notifications-bottom-left"
+- region "Notifications-bottom"
+- region "Notifications-bottom-right"
