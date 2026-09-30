@@ -1,0 +1,361 @@
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head id="Head1"><title>
+	ComfortDelGro Driving Centre Online Booking Portal
+</title><link href="../App_Themes/Default.css" rel="stylesheet" type="text/css" /><link rel="shortcut icon" type="image/x-icon" href="../favicon.ico" />
+    <!-- Added for Zencode -->
+    
+    <style type="text/css">
+        .label-style{
+            border:1px solid;
+            border-radius: 8px 8px;
+            font-weight:bold;
+            font-size:14px;
+            color:#000000;
+            padding:10px 20px 10px 20px;
+        }
+
+/*        .payment-labels
+        {
+            height: 40px; 
+            width: 100%;
+            justify-content:flex-start;
+            display:inline-flex;
+        }*/
+
+        .payment-labels span:hover
+        {
+            border:1px solid;
+            border-radius: 8px 8px;
+            font-weight:bold;
+            font-size:14px;
+            color:white;
+            padding:10px 20px 10px 20px;
+            background-color:#999999;
+        }
+        .nodeLevel1
+        {
+        }   
+         .nodeLevel2
+        {
+        }   
+         .nodeLevel3
+         {
+            white-space:normal !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="content">
+            
+
+<header>
+    <div class="logo-container">
+        <a href="/NewPortal/Booking/Dashboard.aspx">
+            <img src="/NewPortal/App_Themes/images/Company_logo.png"  alt="Company logo">
+        </a>
+    </div>
+    <div class="nav">
+        <div id="sub-menu-dropdown" class="image-container" data-menu='Menu'> 
+            <div id="dropdown-icon">
+                <img src="/NewPortal/App_Themes/images/Menu.png" alt="Home" class="dropdown-img">
+                <div class="dropdown-content">
+                </div>
+            </div>
+        </div>       
+        <div class="image-container">
+            <a href="/NewPortal/logOut.aspx?PageName=Logout">
+                <img src="/NewPortal/App_Themes/images/Logout_img.png" alt="Logout">
+            </a>
+        </div>
+    </div>
+</header>
+
+
+            
+
+<div class="details-container">
+    <div class="left">
+        <div class="details-grid">
+            <div class="pair">
+                <div class="detail">Name:</div>
+                <div class="value">
+                     <span id="HeaderSub_lblName">LI RUN </span>
+                </div>
+            </div>
+            <div class="pair">
+                <div class="detail">Course Enrolled: </div>
+                <div class="value">
+                    <span id="HeaderSub_lblCourse">01. Class 3 Motorcar</span>
+                </div>
+            </div>
+            <div class="pair">
+                <div class="detail">Learner ID:</div>
+                <div class="value">
+                    <span id="HeaderSub_lblUserID">00973660</span>
+                </div>
+            </div>
+            <div class="pair">
+                <div class="detail">Membership Expiry:</div>
+                <div class="value">
+                    <span id="HeaderSub_lblExpiryDate">16-Jun-2027</span>
+                </div>
+            </div>
+            <div class="pair stack" style="grid-column: span 2;">
+                 <span id="HeaderSub_lblExpress" class="detail" style="display:none;">Express Course:</span>
+                <div class="value">
+                    <span id="HeaderSub_expressValue" style="display:none;">Not Eligible</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="right">
+        <div class="detail1">Store Value Balance:</div>
+        <div class="balance">
+            <span id="HeaderSub_lblStoreValue">$323.54</span>  
+        </div>
+    </div>
+</div>
+
+
+            <div class="main-placeholder">
+                <form method="post" action="./BookingConfirm.aspx" onsubmit="javascript:return WebForm_OnSubmit();" id="form1" style="padding: 2px; overflow-x: auto;">
+<div class="aspNetHidden">
+<input type="hidden" name="__EVENTTARGET" id="__EVENTTARGET" value="" />
+<input type="hidden" name="__EVENTARGUMENT" id="__EVENTARGUMENT" value="" />
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="xylqq2VdaFPqhhvQx/pA1M0oNKdlVMYfOxkxkNOTos/zsmauq8noEBYGmJ4qXXzPZ4TEfyBolEvTFELy9jI4O63r91GLI8PO7sQS9eSqtxzWjLdkoaojjik5vR6eXSkfd5U6d3hhvwgGmPvwd4/F7sHMdLPtlRHVp87XP1x9gFk77GcAyQ58FgketxDeZiHrI/wEuuSxpCbZNjHr0sFjpAWY01dxq50Sz026jng3MzIJzEAPpro8eGOSg169+TU5oNyW9el5U9fhfrRmDepLDOS9P7ysD0J7AeQgxHa+T3FBBwyXTH90p8yM5JVHytTXvdNwH1FawmTzlrwIyDMQM+m8X4KVXMe8NrVan9ElDIHhgawBo1qIi7KYGfGqr2mWKvU6hzQLHd7YWQ0frV+cJzjcj6IpTGyLH3Ym7LYVLvn3Jhc2lbj9VGWJ/ic0K/8r8U6U0w2Z3C1EIypY36unR/3o3qpJQHWdCFGWRX/OyMrnsMnfaRPdnKhMH32rgFEvxl8ME5070nn7MHuRhQOuTqrpNF7fKflidS4rzBfSh03VAaoriP/p75BPkFtd6lZ6tJAZhQLd/IGOpKE273Xy6ghgBjyW/qzivX6YqjaUr05xheZQ1xUhjnlwPReCuW/Xh/KrTkQfxXVsDnYP+cO9t4D/GjMITV2IIE6cfOGv+hREBFjzrr4Ss5GmrBoTzwGCoLz6jXGM3Kgmmh5e7sG0gDAobZOpjLHC36H23bBJitHHGFB/Rdnw4UezaSZkd42HcwYsf/xQFyY5wG688Q6GtlYTz2fC34YP+HObj43UNXjDyZ8Lb3bCImtGKiBSAnMedFoPEaTOVJCGPn2Dle2A+HlOa4PYla3Ap4vKWhangWif9OIwRWp3EzA6caqIyihwP9KPMxZ5pMtPTzaoH685LCOh+LSHFhc9doTvW/6Tfhn/Mk2zuatUyMQKkt/zosXjR3JpHe+iwcwCCOdU28gtvi9m3VN4lvhJaRYTg57VfH0EPdk2kqczsx1cYT3DvGwQqHOt/eCpob70a5FuCzTrTKIhnVOv7h3cmbai2myIdDv0nn96wPb5QOF8010yutLyvsNt0I32ohFXyTi6ja/jYyWdaWwyvCeUk15Ly8dg4aE5L20rnYVqnJguSW/TOokaE9UN9f44kbdjix9iSGAASocVa8z3QahQiMniuelKRIg1hS0brupNfeFhG2x9lyw7SfJE69diHwvnlA7O5hkdbHDxgrUClakpO/Dmu5jCDCVa7iSzS2+CbXvQ5wtKSlWjWQR43HxdGLb8lrp6o+Jzu2Gfn0Oh3ROnvyc6v8PScRWF81k0PlX4zyNaxtOBBQX89R+OMqP8gcuWmJWnYJqm0nkN4dlkFCAzXExpyFUlpkkD0a+NDC/yJqpRQj3Pbcda" />
+</div>
+
+<script type="text/javascript">
+//<![CDATA[
+var theForm = document.forms['form1'];
+if (!theForm) {
+    theForm = document.form1;
+}
+function __doPostBack(eventTarget, eventArgument) {
+    if (!theForm.onsubmit || (theForm.onsubmit() != false)) {
+        theForm.__EVENTTARGET.value = eventTarget;
+        theForm.__EVENTARGUMENT.value = eventArgument;
+        theForm.submit();
+    }
+}
+//]]>
+</script>
+
+
+<script src="/NewPortal/WebResource.axd?d=pynGkmcFUV13He1Qd6_TZGDzu0i0T1jQE-aBs0rjmvjlunvcRGz3jPcThp6qH5yBiWgt9yl_6uK3qKvCmp66Vg2&amp;t=638901824248157332" type="text/javascript"></script>
+
+
+<script src="/NewPortal/ScriptResource.axd?d=nv7asgRUU0tRmHNR2D6t1IcmlfnNfQdSMeemdr7ryXoaIGrACbkpLOvJgKTmHpOWElKTCpQm9NLpsSbzMj-Jgi5jHSduniVLjcBulGgP_6nHs45AlyTLxKW2pP0_fBW8POoIlsrfUo2b6bxX5_Asgg2&amp;t=ffffffff93d1c106" type="text/javascript"></script>
+<script src="/NewPortal/ScriptResource.axd?d=NJmAwtEo3Ipnlaxl6CMhvvggtYxL_P107flF2PPp-vuWS3wMMBtOEHVeB1RGnjNEi9Pv77BrJN1xn75I-5PiLFp5yEa2r90Wu74kS-_B39KyuoPNRvuUizjrYhDkAhsdmwHwnV3fTlfkgUBufovc_zembihFTYmwv6tg73gw4PM1&amp;t=5c0e0825" type="text/javascript"></script>
+<script src="/NewPortal/ScriptResource.axd?d=dwY9oWetJoJoVpgL6Zq8OC6gBv0-cV_2_Is0Jb9PQVV_JPfOdMWsblrqsGUpe4Noq4Kh0HRqdl0M1LtvCV0q2wJojA9klGpO8zX80f23Kz5EzuXrRpqXHSN_m0Ae4_pf7iExq8bqWsxU86hJ3jvIP56L5jigvKNSTJvnVU1ic841&amp;t=5c0e0825" type="text/javascript"></script>
+<script type="text/javascript">
+//<![CDATA[
+function WebForm_OnSubmit() {
+if (typeof(ValidatorOnSubmit) == "function" && ValidatorOnSubmit() == false) return false;
+return true;
+}
+//]]>
+</script>
+
+<div class="aspNetHidden">
+
+	<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="AAD20199" />
+	<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="P+GW6W8iR99S96+wQq+GwkhOj7vHBJG5uQma8V/86ndA91wRDgzxkEYXA5rdRdRU4wuI3PNp1e+8vDgWcaFFfwDyqD67PB32kXJABEXAQT8uZAuw6LJv1i8xySV+abOMBOFW7Wm2OkmBbEVLu2xXtPG0E4lycXj3aGOGNWm8A3vTyua8kAgkQYxNLSN5T+jS" />
+</div>
+                    
+
+    <script language="javascript">
+       function ConfirmMessage() {
+            var result = confirm('No cancellation or refund after booking. Do you want to procced for payment and confirm booking?');
+            if (result)
+            {
+                document.getElementById('ContentPlaceHolder1_btnNextHidden').click();
+            }
+        }
+ function SelectAllCheckboxes(spanChk){
+
+   // Added as ASPX uses SPAN for checkbox
+   var oItem = spanChk.children;
+   var theBox= (spanChk.type=="checkbox") ? 
+        spanChk : spanChk.children.item[0];
+   xState=theBox.checked;
+   elm=theBox.form.elements;
+
+   for(i=0;i<elm.length;i++)
+     if(elm[i].type=="checkbox" && 
+              elm[i].id!=theBox.id)
+     {
+       
+       if(elm[i].checked!=xState)
+         elm[i].click();
+     
+     }
+ }
+    </script>
+
+    <div>
+        <table border="0" cellspacing="0" cellpadding="0" style="width: 100%">
+            <tr>
+                <td>
+                    <table width="100%">
+                        <tr>
+                            <td style="height: 20px">
+                                <script type="text/javascript">
+//<![CDATA[
+Sys.WebForms.PageRequestManager._initialize('ctl00$ContentPlaceHolder1$ScriptManager1', 'form1', ['tctl00$ContentPlaceHolder1$updDataGrid','ContentPlaceHolder1_updDataGrid','tctl00$ContentPlaceHolder1$updpnlSave','ContentPlaceHolder1_updpnlSave'], ['ctl00$ContentPlaceHolder1$gvBooking','ContentPlaceHolder1_gvBooking'], [], 90, 'ctl00');
+//]]>
+</script>
+
+                            </td>
+                        </tr>
+                        <tr>
+                            <td colspan="2">
+                                <img id="ContentPlaceHolder1_Image1" src="../App_Themes/images/icon_booking.gif" align="absbottom" />
+                                <span id="ContentPlaceHolder1_Label1" style="color:Black;font-size:14px;font-weight:bold;">Booking Confirmation</span>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="height: 20px">
+                                <span id="ContentPlaceHolder1_lblMsg" style="color:Red;"></span></td>
+                        </tr>
+                        <tr>
+                            <td style="height: 20px" valign="baseline">
+                                Please confirmed the following session(s).<br />
+                                <br />
+                                <span id="ContentPlaceHolder1_lblReserveSessionNote" style="color:Red;font-weight:bold;font-style:normal;">Note:  Session(s) will be cleared from our system if you do not confirm within half an hour.</span><br />
+                                &nbsp;</td>
+                        </tr>
+                    </table>
+                    <table cellspacing="0" cellpadding="0" style="width: 700px">
+                        <tr>
+                            <td style="width: 702px" align="left">
+                                <div id="ContentPlaceHolder1_updDataGrid">
+	
+                                        &nbsp;<div id="ContentPlaceHolder1_progressBookingConfirm" style="display:none;">
+		
+                                                <br />
+                                                <img id="ContentPlaceHolder1_Image2" src="../images/Progress.gif" />
+                                                <span id="ContentPlaceHolder1_Label3" style="font-family:Tahoma;font-size:10px;font-weight:bold;font-style:italic;">Processing...</span>
+                                            
+	</div>
+                                        <div>
+		<table cellspacing="0" cellpadding="2" id="ContentPlaceHolder1_gvBooking" style="background-color:White;border-width:1px;border-style:None;width:695px;border-collapse:collapse;">
+			<tr style="color:#FFFFCC;background-color:#0085CC;font-weight:bold;">
+				<th scope="col" style="color:White;width:40px;">Cancel</th><th scope="col" style="color:White;width:120px;">Session Date</th><th scope="col" style="color:White;width:120px;">Session No</th><th scope="col" style="color:White;width:120px;">Start</th><th scope="col" style="color:White;width:120px;">End</th><th align="center" scope="col" style="color:White;width:120px;">Course</th><th align="center" scope="col" style="color:White;width:35px;">Fee</th><th align="center" scope="col" style="color:White;width:80px;">GST</th><th scope="col" style="color:White;width:55px;">Total</th>
+			</tr><tr style="background-color:White;">
+				<td align="center" style="width:40px;">
+                                                        <input type="image" name="ctl00$ContentPlaceHolder1$gvBooking$ctl02$btnDelete" id="ContentPlaceHolder1_gvBooking_btnDelete_0" Text="Remove" src="../images/cross.gif" onclick="javascript:return confirm(&#39;Cancel reserved session?&#39;);WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions(&quot;ctl00$ContentPlaceHolder1$gvBooking$ctl02$btnDelete&quot;, &quot;&quot;, true, &quot;&quot;, &quot;&quot;, false, false))" />
+                                                    </td><td align="center" style="width:120px;">01/Sep/2026</td><td align="center" style="width:120px;">11</td><td align="center" style="width:120px;">20:15:00</td><td align="center" style="width:120px;">21:05:00</td><td align="center" style="width:120px;">SCHOOL E-TRIAL TEST</td><td align="center" style="width:35px;">0.00</td><td align="center" style="width:80px;">0.00</td><td align="center" style="width:55px;">
+                                                        $0.00
+                                                    </td>
+			</tr><tr style="background-color:#0085CC;height:30px;">
+				<td>&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td><td style="color:Black;font-weight:bold;">&nbsp;</td><td>&nbsp;</td><td style="color:White;font-weight:bold;">Sub Total</td><td style="color:White;font-weight:bold;width:60px;">
+                                                        $0.00
+                                                    </td>
+			</tr>
+		</table>
+	</div>
+
+                                        <br />
+                                        <div>
+		<table cellspacing="0" cellpadding="2" id="ContentPlaceHolder1_gvMiscCharges" style="background-color:White;border-width:1px;border-style:None;width:695px;border-collapse:collapse;">
+			<tr style="color:#FFFFCC;background-color:#0085CC;font-weight:bold;">
+				<th scope="col" style="width:510px;">&nbsp;</th><th align="center" scope="col" style="color:White;width:35px;">Fee</th><th align="center" scope="col" style="color:White;width:120px;">GST</th><th align="center" scope="col" style="color:White;width:55px;">Total</th>
+			</tr><tr style="background-color:White;">
+				<td style="width:510px;">Miscellaneous Charges</td><td align="center" style="width:35px;">0.00</td><td align="center" style="width:120px;">0.00</td><td align="center" style="width:50px;">
+                                                        $0.00
+                                                    </td>
+			</tr><tr style="background-color:#0085CC;height:30px;">
+				<td style="color:White;font-weight:bold;">&nbsp;</td><td style="color:White;font-weight:bold;">&nbsp;</td><td style="color:White;font-weight:bold;">Grand Total</td><td style="color:White;font-weight:bold;">
+                                                    <span id="ContentPlaceHolder1_gvMiscCharges_lblTotalAmt">0.00</span>
+                                                    </td>
+			</tr>
+		</table>
+	</div>
+                                    
+</div>
+                                &nbsp;
+                            </td>
+                        </tr>
+                        <tr  >
+                            <td style="width: 702px; height: 40px">
+                                <span id="ContentPlaceHolder1_cvResult" class="ResultMsgStyl" style="display:inline-block;width:100%;display:none;"></span>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td align="center" style="width: 702px; height: 30px">
+                                <span id="ContentPlaceHolder1_Label2" style="color:Black;font-weight:bold;">Please verify the information and click 'Confirm Booking'. </span></td>
+                        </tr>
+                        <tr align="center">
+                            <td style="width: 702px;">
+                                &nbsp;&nbsp;<input type="submit" name="ctl00$ContentPlaceHolder1$btnConfirm" value="Confirm Booking" onclick="javascript:WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions(&quot;ctl00$ContentPlaceHolder1$btnConfirm&quot;, &quot;&quot;, true, &quot;&quot;, &quot;&quot;, false, false))" id="ContentPlaceHolder1_btnConfirm" style="color:Black;background-color:#FFB500;border-color:#FFB500;font-weight:bold;padding: 2px; width:auto;" />&nbsp;<input type="submit" name="ctl00$ContentPlaceHolder1$btnCancel" value="Cancel" onclick="javascript:WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions(&quot;ctl00$ContentPlaceHolder1$btnCancel&quot;, &quot;&quot;, true, &quot;&quot;, &quot;&quot;, false, false))" id="ContentPlaceHolder1_btnCancel" style="color:White;background-color:#999999;border-color:#999999;font-weight:bold;padding: 2px; width: 80px;" /><br />
+                                <div id="ContentPlaceHolder1_updpnlSave">
+	
+                                        <input type="submit" name="ctl00$ContentPlaceHolder1$btnNextHidden" value="Next Hidden" onclick="javascript:WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions(&quot;ctl00$ContentPlaceHolder1$btnNextHidden&quot;, &quot;&quot;, true, &quot;&quot;, &quot;&quot;, false, false))" id="ContentPlaceHolder1_btnNextHidden" style="display: none" />&nbsp;
+                                    
+</div>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+                
+<script type="text/javascript">
+//<![CDATA[
+var Page_Validators =  new Array(document.getElementById("ContentPlaceHolder1_cvResult"));
+//]]>
+</script>
+
+<script type="text/javascript">
+//<![CDATA[
+var ContentPlaceHolder1_cvResult = document.all ? document.all["ContentPlaceHolder1_cvResult"] : document.getElementById("ContentPlaceHolder1_cvResult");
+ContentPlaceHolder1_cvResult.display = "Dynamic";
+ContentPlaceHolder1_cvResult.evaluationfunction = "CustomValidatorEvaluateIsValid";
+//]]>
+</script>
+
+
+<script type="text/javascript">
+//<![CDATA[
+
+var Page_ValidationActive = false;
+if (typeof(ValidatorOnLoad) == "function") {
+    ValidatorOnLoad();
+}
+
+function ValidatorOnSubmit() {
+    if (Page_ValidationActive) {
+        return ValidatorCommonOnSubmit();
+    }
+    else {
+        return true;
+    }
+}
+        Sys.Application.add_init(function() {
+    $create(Sys.UI._UpdateProgress, {"associatedUpdatePanelId":null,"displayAfter":500,"dynamicLayout":true}, null, null, $get("ContentPlaceHolder1_progressBookingConfirm"));
+});
+
+document.getElementById('ContentPlaceHolder1_cvResult').dispose = function() {
+    Array.remove(Page_Validators, document.getElementById('ContentPlaceHolder1_cvResult'));
+}
+//]]>
+</script>
+</form>
+            </div>
+        </div>
+         
+    </div>
+    <script src="/NewPortal/ClientScripts/custom.js"></script>
+    
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"d0654827340042e6b1e04ddec618f0b0"}' crossorigin="anonymous"></script>
+</body>
+</html>

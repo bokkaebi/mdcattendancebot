@@ -245,13 +245,16 @@ async def _submit_otp(page: Page) -> None:
 
 
 async def _consent_agree(page: Page, cfg: Config) -> None:
-    # USER-REPORTED: consent page has "Cancel" / "I Agree" buttons; click "I Agree".
-    log.info("waiting for consent (Cancel / I Agree) page")
-    # Match the visible text the operator sees (resilient to aria-label overrides).
+    # Singpass can reuse prior MyInfo consent and redirect straight back to FormSG.
+    log.info("waiting for consent (Cancel / I Agree) page or authenticated form")
     agree = page.locator("button", has_text="I Agree")
-    if not await _safe_visible(agree.first, timeout_ms=60000):
-        agree = page.get_by_role("button", name="I Agree")
-    await expect(agree.first).to_be_visible(timeout=15000)
+    form = page.locator('form[novalidate] div[role="radiogroup"]').first
+    await expect(agree.or_(form).first).to_be_visible(
+        timeout=cfg.navigation_timeout_ms
+    )
+    if await form.is_visible():
+        log.info("consent already satisfied; redirected directly to authenticated form")
+        return
     await agree.first.click()
     log.info("clicked 'I Agree' on consent page")
 
