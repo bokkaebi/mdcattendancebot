@@ -1,36 +1,17 @@
-"""Telegram bot front-end for the Singpass attendance flow.
+"""Private, allowlisted Telegram interface for assisted attendance submission."""
 
-Exposes :func:`bot.run_flow` as a guided chat: ``/attend`` -> inline status
-buttons -> (for MC) clinic + timing prompts -> OTP prompt at 2FA -> submit.
-Each run is one Chromium instance; concurrency is bounded by
-``MAX_CONCURRENT_RUNS``. Runs are headless by default; ``--headed`` shows
-the browser windows. Per-user Singpass credentials live in ``users.json``
-(gitignored, tightened to 0600 on load).
-
-``/start`` onboards new users by collecting Singpass ID + password in-chat
-(the password message is deleted after capture). ``/schedule`` opens a 2-week
-calendar; ``/time`` sets the daily auto-submit time. A background scheduler
-fires scheduled runs at the configured time ±10 min (random jitter).
-"""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import contextlib
 import logging
-import re
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-import uvicorn
-from telegram import (
-    Bot,
-    BotCommand,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-from telegram.error import BadRequest
+from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -40,377 +21,336 @@ from telegram.ext import (
     filters,
 )
 
-from .attendance import NORMAL_ANSWERS, WFH_ANSWERS, mc_answers
-from .bot import run_flow
+from .attendance import NORMAL_ANSWERS, WFH_ANSWERS, Answers, mc_answers, validate_answers
 from .config import Config, load_config
-from .otp import OtpProvider
+from .otp import OtpProvider, validate_otp
+from .runner import AttendanceRunner, BusyRun, DuplicateRun
 from .scheduler import Scheduler
 from .schedules import Schedule, load_schedules, save_schedule
-from .server import (
-    OtpDeliveryStatus,
-    create_telegram_otp_app,
-    make_server,
-    serve_quietly,
-    stop_server,
-)
-from .users import User, load_users, save_user
+from .server import OtpHttpServer
+from .storage import StateStore
+from .users import User, load_users
 
 log = logging.getLogger("mdcattendance.telegram")
+SG = ZoneInfo("Asia/Singapore")
 
 
 @dataclass
 class BotState:
     base_cfg: Config
     users_path: str
-    schedules_path: str
     interactions: dict[int, Interaction]
     active_chats: set[int]
-    semaphore: asyncio.Semaphore
     app: Application
-    otp_server: uvicorn.Server | None = None
-    otp_server_task: asyncio.Task[None] | None = None
+    store: StateStore
+    runner: AttendanceRunner
     scheduler: Scheduler | None = None
+    otp_server: OtpHttpServer | None = None
 
 
 class Interaction:
-    """One outstanding prompt per chat, resolved serially via a single future."""
+    """One user-owned session with one current, message-bound prompt."""
 
     def __init__(self, chat_id: int, state: BotState, app: Application) -> None:
         self.chat_id = chat_id
         self._state = state
         self._app = app
+        self.task: asyncio.Task | None = None
         self._future: asyncio.Future[str] | None = None
-        self._expecting: str | None = None  # "choice" | "otp" | "clinic" | "timing" | ...
-        self.task: asyncio.Task[None] | None = None
-        self._last_message_id: int | None = None
+        self._expecting: str | None = None
+        self._pending_token: object | None = None
+        self._prompt_message_id: int | None = None
+        self._choices: set[str] = set()
         self._cal_msg_id: int | None = None
+        self.scheduled = False
 
     async def send(self, text: str) -> None:
         await self._app.bot.send_message(self.chat_id, text)
+
+    def clear_pending(self) -> None:
+        if self._future is not None and not self._future.done():
+            self._future.cancel()
+        self._future = None
+        self._expecting = None
+        self._pending_token = None
+        self._prompt_message_id = None
+        self._choices.clear()
+
+    async def _ask(
+        self, prompt: str, expecting: str, timeout: float, markup=None, choices: set[str] | None = None
+    ) -> str:
+        self.clear_pending()
+        token = object()
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._pending_token = token
+        self._future = future
+        self._expecting = expecting
+        self._choices = choices or set()
+        try:
+            msg = await self._app.bot.send_message(self.chat_id, prompt, reply_markup=markup)
+            self._prompt_message_id = msg.message_id
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            if self._pending_token is token:
+                self.clear_pending()
+
+    async def ask_text(self, prompt: str, expecting: str, timeout: float) -> str:
+        return await self._ask(prompt, expecting, timeout, ForceReply(selective=True))
 
     async def ask_choice(self, prompt: str, options: list[tuple[str, str]]) -> str:
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton(label, callback_data=data)] for label, data in options]
         )
-        self._expecting = "choice"
-        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._future = fut
-        await self._app.bot.send_message(self.chat_id, prompt, reply_markup=keyboard)
-        return await asyncio.wait_for(fut, timeout=self._state.base_cfg.prompt_timeout)
+        return await self._ask(
+            prompt,
+            "choice",
+            self._state.base_cfg.prompt_timeout,
+            keyboard,
+            {data for _, data in options},
+        )
 
-    async def ask_text(self, prompt: str, expecting: str, timeout: float) -> str:
-        self._expecting = expecting
-        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._future = fut
-        await self.send(prompt)
-        return await asyncio.wait_for(fut, timeout=timeout)
-
-    def deliver_text(self, text: str, *, message_id: int | None = None) -> bool:
-        self._last_message_id = message_id
-        if (
-            self._expecting is not None
-            and self._expecting not in {"choice", "schedule"}
-            and self._future
+    def _current(self, user_id: int, chat_id: int, reply_to_message_id: int | None) -> bool:
+        return (
+            user_id == self.chat_id == chat_id
+            and self._state.interactions.get(user_id) is self
+            and self._pending_token is not None
+            and self._prompt_message_id is not None
+            and reply_to_message_id == self._prompt_message_id
+            and self._future is not None
             and not self._future.done()
-        ):
-            self._future.set_result(text)
-            return True
-        return False
+        )
 
-    def deliver_otp(self, text: str) -> bool:
-        if self._expecting == "otp" and self._future and not self._future.done():
-            self._future.set_result(text)
-            return True
-        return False
+    def deliver_otp(
+        self, text: str, *, user_id: int, chat_id: int, reply_to_message_id: int | None
+    ) -> bool:
+        if self._expecting != "otp" or not self._current(user_id, chat_id, reply_to_message_id):
+            return False
+        future = self._future
+        if future is None or future.done():
+            return False
+        otp = validate_otp(text)
+        future.set_result(otp)
+        return True
 
-    def deliver_choice(self, data: str) -> bool:
-        if self._expecting == "choice" and self._future and not self._future.done():
-            self._future.set_result(data)
-            return True
-        return False
+    def deliver_text(
+        self, text: str, *, user_id: int, chat_id: int, reply_to_message_id: int | None
+    ) -> bool:
+        if self._expecting in {None, "otp", "choice", "schedule"}:
+            return False
+        if not self._current(user_id, chat_id, reply_to_message_id):
+            return False
+        future = self._future
+        if future is None or future.done():
+            return False
+        future.set_result(text.strip())
+        return True
 
-    async def send_calendar(self, text: str, keyboard: InlineKeyboardMarkup) -> None:
-        msg = await self._app.bot.send_message(self.chat_id, text, reply_markup=keyboard)
-        self._cal_msg_id = msg.message_id
-
-    async def wait_for_done(self) -> None:
-        self._expecting = "schedule"
-        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._future = fut
-        await asyncio.wait_for(fut, timeout=self._state.base_cfg.prompt_timeout)
-
-    def deliver_done(self) -> bool:
-        if self._expecting == "schedule" and self._future and not self._future.done():
-            self._future.set_result(None)
-            return True
-        return False
-
-    def clear_pending(self) -> None:
-        if self._future and not self._future.done():
-            self._future.cancel()
-        self._future = None
-        self._expecting = None
+    def deliver_choice(self, data: str, *, user_id: int, chat_id: int, message_id: int) -> bool:
+        if self._expecting != "choice" or data not in self._choices:
+            return False
+        if not self._current(user_id, chat_id, message_id):
+            return False
+        future = self._future
+        if future is None or future.done():
+            return False
+        future.set_result(data)
+        return True
 
 
 class TelegramOtpProvider:
-    """Collects the Singpass 2FA OTP in-chat; satisfies :class:`OtpProvider`."""
-
     def __init__(self, interaction: Interaction) -> None:
         self._interaction = interaction
 
     async def wait_for_otp(self, timeout: float) -> str:
-        text = await self._interaction.ask_text(
-            "Waiting for the Singpass OTP. Reply here or use the HTTP OTP endpoint:",
+        return await self._interaction.ask_text(
+            "Reply to THIS message with the current six-digit Singpass OTP, or use phone "
+            "delivery if provisioned. Earlier replies are not accepted.",
             "otp",
             timeout,
         )
-        if not re.search(r"\d", text):
-            raise RuntimeError("OTP response contained no digits")
-        return text
 
 
-async def _deliver_http_otp(
-    state: BotState, chat_id: int, otp: str
-) -> OtpDeliveryStatus:
-    interaction = state.interactions.get(chat_id)
-    if interaction is None:
-        return OtpDeliveryStatus.NO_ACTIVE_RUN
-    if interaction.deliver_otp(otp):
-        return OtpDeliveryStatus.ACCEPTED
-    return OtpDeliveryStatus.NOT_WAITING
+def _task_done(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        log.error("Telegram session task failed; sensitive details omitted")
 
 
-async def _drive(
-    interaction: Interaction,
-    user: User,
-    *,
-    dry_run: bool = False,
-    status: str | None = None,
-) -> None:
+def _release(interaction: Interaction) -> None:
+    interaction.clear_pending()
+    state = interaction._state
+    if state.interactions.get(interaction.chat_id) is interaction:
+        state.interactions.pop(interaction.chat_id)
+        state.active_chats.discard(interaction.chat_id)
+
+
+def _begin_session(state: BotState, uid: int) -> Interaction:
+    if uid in state.interactions:
+        raise BusyRun("session busy")
+    interaction = Interaction(uid, state, state.app)
+    state.interactions[uid] = interaction
+    state.active_chats.add(uid)
+    return interaction
+
+
+async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> User | None:
+    chat, sender = update.effective_chat, update.effective_user
+    if chat is None or sender is None or chat.type != "private" or chat.id != sender.id:
+        if update.callback_query:
+            await update.callback_query.answer("Private chats only.")
+        return None
+    state: BotState = context.application.bot_data["mdc"]
+    user = load_users(state.users_path).get(sender.id)
+    if user is None:
+        if update.callback_query:
+            await update.callback_query.answer("Not authorised.")
+        else:
+            await context.bot.send_message(
+                chat.id, "Not authorised. Ask the operator to provision your credentials locally."
+            )
+    return user
+
+
+async def _collect(
+    interaction: Interaction, user: User, *, dry_run: bool = False, status: str | None = None
+) -> tuple[Config, OtpProvider, Answers]:
+    state = interaction._state
+    if status is None:
+        status = await interaction.ask_choice(
+            "Select attendance status:",
+            [("Normal", "normal"), ("Work-from-Home", "wfh"), ("Medical Certificate (MC)", "mc")],
+        )
+    if status == "normal":
+        answers = dict(NORMAL_ANSWERS)
+    elif status == "wfh":
+        answers = dict(WFH_ANSWERS)
+    elif status == "mc":
+        while True:
+            clinic = await interaction.ask_text(
+                "Clinic / Hospital / Medical Centre Name:", "clinic", state.base_cfg.prompt_timeout
+            )
+            timing = await interaction.ask_text(
+                "Appointment Timing (24hr, e.g. 0930hrs):", "timing", state.base_cfg.prompt_timeout
+            )
+            try:
+                answers = mc_answers(clinic, timing)
+                validate_answers(answers)
+                break
+            except ValueError:
+                await interaction.send(
+                    "Enter a nonblank clinic and valid 24-hour HHMM timing (optionally followed by hrs)."
+                )
+    else:
+        raise ValueError("unsupported attendance status")
+    validate_answers(answers)
+    cfg = replace(
+        state.base_cfg,
+        singpass_id=user.singpass_id,
+        singpass_password=user.singpass_password,
+        dry_run=dry_run,
+        discover=False,
+        preflight=False,
+    )
+    provider: OtpProvider = TelegramOtpProvider(interaction)
+    current_user = load_users(state.users_path).get(user.telegram_id)
+    if state.otp_server is not None and current_user is not None and current_user.otp_token:
+        provider = state.otp_server.provider(str(user.telegram_id), provider)
+    return cfg, provider, answers
+
+
+async def _drive(interaction: Interaction, user: User, *, dry_run: bool, override: bool) -> None:
     state = interaction._state
     try:
-        async with state.semaphore:
-            if dry_run:
-                answers = dict(NORMAL_ANSWERS)
-            elif status is not None:
-                if status == "wfh":
-                    answers = dict(WFH_ANSWERS)
-                elif status == "mc":
-                    clinic = await interaction.ask_text(
-                        "Clinic / Hospital / Medical Centre Name:",
-                        "clinic",
-                        state.base_cfg.prompt_timeout,
-                    )
-                    timing = await interaction.ask_text(
-                        "Appointment Timing (24hr, e.g. 0930hrs):",
-                        "timing",
-                        state.base_cfg.prompt_timeout,
-                    )
-                    answers = mc_answers(clinic, timing)
-                else:  # "normal"
-                    answers = dict(NORMAL_ANSWERS)
-            else:
-                choice = await interaction.ask_choice(
-                    "Select today's status:",
-                    [
-                        ("Normal", "normal"),
-                        ("Work-from-Home", "wfh"),
-                        ("Medical Certificate (MC)", "mc"),
-                    ],
-                )
-                if choice == "normal":
-                    answers = dict(NORMAL_ANSWERS)
-                elif choice == "wfh":
-                    answers = dict(WFH_ANSWERS)
-                else:
-                    clinic = await interaction.ask_text(
-                        "Clinic / Hospital / Medical Centre Name:",
-                        "clinic",
-                        state.base_cfg.prompt_timeout,
-                    )
-                    timing = await interaction.ask_text(
-                        "Appointment Timing (24hr, e.g. 0930hrs):",
-                        "timing",
-                        state.base_cfg.prompt_timeout,
-                    )
-                    answers = mc_answers(clinic, timing)
-            answers["Department"] = user.department
-            cfg = replace(
-                state.base_cfg,
-                singpass_id=user.singpass_id,
-                singpass_password=user.singpass_password,
-                dry_run=dry_run,
-                discover=False,
-                preflight=False,
-            )
-            otp: OtpProvider = TelegramOtpProvider(interaction)
-            if dry_run:
-                await interaction.send(
-                    "Dry run: filling Normal attendance without submitting. "
-                    "The browser will remain open for 30 seconds after the form is filled."
-                )
-            await interaction.send(
-                "Logging in to Singpass — you'll be asked for your OTP when 2FA is reached."
-            )
-            await run_flow(cfg, otp, answers)
-            if dry_run:
-                await interaction.send(
-                    "Dry run complete — Normal attendance was filled but not submitted. "
-                    "The browser stayed open for 30 seconds and is now closed."
-                )
-            else:
-                await interaction.send("Attendance submitted successfully.")
-    except asyncio.CancelledError:
-        await interaction.send("Run cancelled.")
-        raise
-    except TimeoutError:
-        await interaction.send("Run timed out waiting for your response and was cancelled.")
-    except Exception as exc:  # noqa: BLE001
-        log.exception("attendance run failed")
-        await interaction.send(f"Run failed: {exc}")
-    finally:
-        state.active_chats.discard(interaction.chat_id)
-        state.interactions.pop(interaction.chat_id, None)
-
-
-def _begin_session(
-    state: BotState, app: Application, chat_id: int
-) -> str | None:
-    """Create+register an :class:`Interaction` for the chat.
-
-    Returns ``None`` on success (the interaction is in
-    ``state.interactions[chat_id]``; the caller assigns ``interaction.task``)
-    or a human-readable busy reason.
-    """
-    if chat_id in state.active_chats:
-        return "A session is already in progress. Send /cancel to abort it."
-    interaction = Interaction(chat_id, state, app)
-    state.interactions[chat_id] = interaction
-    state.active_chats.add(chat_id)
-    return None
-
-
-def _begin_run(
-    state: BotState,
-    app: Application,
-    chat_id: int,
-    uid: int,
-    *,
-    dry_run: bool,
-    status: str | None = None,
-) -> str | None:
-    """Start an attendance run for the chat.
-
-    Returns ``None`` on success (the ``_drive`` task is already spawned) or a
-    human-readable reason.
-    """
-    users = load_users(state.users_path)
-    if uid not in users:
-        return (
-            f"Not registered — your Telegram user ID is {uid}. "
-            "Ask the operator to add it as a key in users.json."
+        cfg, otp, answers = await _collect(interaction, user, dry_run=dry_run)
+        await interaction.send(
+            "Starting attendance. You will be asked for OTP when required."
+            + (" Dry run: no submission." if dry_run else "")
         )
-    if chat_id in state.active_chats:
-        return "A run is already in progress. Send /cancel to abort it."
-    if state.semaphore._value == 0:
-        return "Server busy (max concurrent runs reached); try again shortly."
-    interaction = Interaction(chat_id, state, app)
-    state.interactions[chat_id] = interaction
-    state.active_chats.add(chat_id)
-    interaction.task = asyncio.create_task(
-        _drive(interaction, users[uid], dry_run=dry_run, status=status)
-    )
-    return None
+        result = await state.runner.run(cfg, otp, answers, override=override)
+        messages = {
+            "confirmed": "Attendance submission confirmed.",
+            "dry_run": "Dry run complete: attendance filled and verified, not submitted.",
+            "unknown": "Submission outcome UNKNOWN. It may have been submitted. "
+            "Do not retry automatically; verify with the operator.",
+            "failed": "Attendance failed before submission. No confirmed submission was recorded.",
+        }
+        await interaction.send(
+            messages.get(
+                result.status,
+                "No attendance submission was confirmed. Check the recorded outcome with the operator.",
+            )
+        )
+    except BusyRun:
+        await interaction.send("Browser busy. Try again later; this request was not queued.")
+    except DuplicateRun:
+        await interaction.send(
+            "An existing attempt blocks this submission. Verify its outcome first. "
+            "Intentional resubmission requires /attend override."
+        )
+    except TimeoutError:
+        await interaction.send("Input timed out. No new run was started.")
+    except asyncio.CancelledError:
+        with contextlib.suppress(TelegramError):
+            await interaction.send(
+                "Run cancelled. If submission had begun its outcome may be UNKNOWN; "
+                "verify before retrying."
+            )
+        raise
+    except Exception:
+        log.error("Attendance session failed; sensitive details omitted")
+        await interaction.send(
+            "Attendance could not complete. Check the recorded outcome before retrying; "
+            "an unconfirmed submission must not be assumed to have failed."
+        )
+    finally:
+        _release(interaction)
 
 
 async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state: BotState = context.application.bot_data["mdc"]
-    chat_id = update.effective_chat.id
-    uid = update.effective_user.id if update.effective_user else 0
-    users = load_users(state.users_path)
-    if uid in users:
-        await _show_menu(context.bot, chat_id, uid)
+    user = await _guard(update, context)
+    if user is None:
         return
-    if chat_id in state.active_chats:
-        await context.bot.send_message(
-            chat_id,
-            "An onboarding session is already in progress. Send /cancel to abort it.",
-        )
-        return
-    interaction = Interaction(chat_id, state, context.application)
-    state.interactions[chat_id] = interaction
-    state.active_chats.add(chat_id)
-    interaction.task = asyncio.create_task(_onboard(interaction, uid))
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Schedule", callback_data="menu:schedule"),
+                InlineKeyboardButton("Set Time", callback_data="menu:time"),
+            ],
+            [
+                InlineKeyboardButton("Attend Now", callback_data="menu:attend"),
+                InlineKeyboardButton("Dry Run", callback_data="menu:dryrun"),
+            ],
+            [InlineKeyboardButton("Cancel", callback_data="menu:cancel")],
+        ]
+    )
     await context.bot.send_message(
-        chat_id,
-        "👋 Welcome! Let's register you. I'll ask for your Singpass ID and password next.",
+        user.telegram_id,
+        "Assisted attendance: OTP and MC details require your input. Schedule times use Asia/Singapore. "
+        "Use /attend override only for an intentional resubmission after checking the previous outcome.",
+        reply_markup=keyboard,
     )
 
 
-async def _onboard(interaction: Interaction, uid: int) -> None:
-    state = interaction._state
-    timeout = state.base_cfg.prompt_timeout
-    try:
-        sid = await interaction.ask_text(
-            "Enter your Singpass ID:", "onboard_id", timeout
-        )
-        await interaction.send(
-            "Now enter your Singpass password. I'll delete this message right "
-            "after I read it, so it won't stay in the chat."
-        )
-        pw = await interaction.ask_text("Password:", "onboard_pw", timeout)
-        if interaction._last_message_id is not None:
-            try:
-                await interaction._app.bot.delete_message(
-                    interaction.chat_id, interaction._last_message_id
-                )
-            except Exception:  # noqa: BLE001
-                log.warning(
-                    "Could not delete password message %s (best-effort).",
-                    interaction._last_message_id,
-                )
-        sid = sid.strip()
-        pw = pw.strip()
-        if not sid or not pw:
-            await interaction.send(
-                "Singpass ID and password must not be empty. Send /start to try again."
-            )
-            return
-        save_user(state.users_path, uid, sid, pw)
-        await interaction.send(
-            f"✅ Registered. Your Telegram user ID is {uid}.\n"
-            f"This chat's ID: {interaction.chat_id}.\n"
-            "You can now schedule attendance."
-        )
-        await _show_menu(interaction._app.bot, interaction.chat_id, uid)
-    except asyncio.CancelledError:
-        await interaction.send("Onboarding cancelled.")
-        raise
-    except TimeoutError:
-        await interaction.send("Onboarding timed out waiting for your response.")
-    except Exception as exc:  # noqa: BLE001
-        log.exception("onboarding failed")
-        await interaction.send(f"Onboarding failed: {exc}")
-    finally:
-        state.active_chats.discard(interaction.chat_id)
-        state.interactions.pop(interaction.chat_id, None)
-
-
-async def _start_run(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, *, dry_run: bool
-) -> None:
-    state: BotState = context.application.bot_data["mdc"]
-    chat_id = update.effective_chat.id
-    uid = update.effective_user.id
-    reason = _begin_run(state, context.application, chat_id, uid, dry_run=dry_run)
-    if reason:
-        await context.bot.send_message(chat_id, reason)
+async def _start_run(update: Update, context: ContextTypes.DEFAULT_TYPE, *, dry_run: bool) -> None:
+    user = await _guard(update, context)
+    if user is None:
         return
-    if dry_run:
-        start_text = "Starting dry run — filling Normal attendance without submitting."
-    else:
-        start_text = "Starting — select your status below."
-    await context.bot.send_message(chat_id, start_text)
+    args = context.args or []
+    if args and (dry_run or args != ["override"]):
+        await context.bot.send_message(user.telegram_id, "Use /attend, /attend override, or /dry_run.")
+        return
+    state: BotState = context.application.bot_data["mdc"]
+    if state.runner.busy:
+        await context.bot.send_message(user.telegram_id, "Browser busy. Try again later.")
+        return
+    try:
+        interaction = _begin_session(state, user.telegram_id)
+    except BusyRun:
+        await context.bot.send_message(user.telegram_id, "A session is active. Use /cancel first.")
+        return
+    interaction.task = asyncio.create_task(
+        _drive(interaction, user, dry_run=dry_run, override=args == ["override"])
+    )
+    interaction.task.add_done_callback(_task_done)
 
 
 async def _attend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -421,413 +361,399 @@ async def _dry_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _start_run(update, context, dry_run=True)
 
 
-async def _time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state: BotState = context.application.bot_data["mdc"]
-    chat_id = update.effective_chat.id
-    uid = update.effective_user.id
-    users = load_users(state.users_path)
-    if uid not in users:
-        await context.bot.send_message(
-            chat_id,
-            f"Not registered — your Telegram user ID is {uid}. "
-            "Ask the operator to add it as a key in users.json.",
-        )
-        return
-    reason = _begin_session(state, context.application, chat_id)
-    if reason:
-        await context.bot.send_message(chat_id, reason)
-        return
-    interaction = state.interactions[chat_id]
-    interaction.task = asyncio.create_task(_set_time(interaction, uid))
-
-
-async def _set_time(interaction: Interaction, uid: int) -> None:
-    state = interaction._state
-    try:
-        raw = await interaction.ask_text(
-            "Enter your submission time (24h HH:MM, e.g. 09:00):",
-            "time",
-            state.base_cfg.prompt_timeout,
-        )
-        t = raw.strip()
-        m = re.fullmatch(r"\d{2}:\d{2}", t)
-        if not m:
-            await interaction.send(
-                "Invalid time. Use HH:MM 24-hour, e.g. 09:00. Send /time to try again."
-            )
-            return
-        hh_s, mm_s = t.split(":")
-        if not (0 <= int(hh_s) <= 23 and 0 <= int(mm_s) <= 59):
-            await interaction.send(
-                "Invalid time. Use HH:MM 24-hour, e.g. 09:00. Send /time to try again."
-            )
-            return
-        save_schedule(state.schedules_path, uid, time=t)
-        await interaction.send(
-            f"⏰ Submission time set to {t}. "
-            f"Scheduled runs will fire within ±10 min of {t}."
-        )
-    except asyncio.CancelledError:
-        await interaction.send("Time setup cancelled.")
-        raise
-    except TimeoutError:
-        await interaction.send("Time setup timed out waiting for your response.")
-    except Exception as exc:  # noqa: BLE001
-        log.exception("time setup failed")
-        await interaction.send(f"Time setup failed: {exc}")
-    finally:
-        state.active_chats.discard(interaction.chat_id)
-        state.interactions.pop(interaction.chat_id, None)
-
-
-async def _show_menu(bot: Bot, chat_id: int, user_id: int) -> None:
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("📅 Schedule", callback_data="menu:schedule"),
-                InlineKeyboardButton("⏰ Set Time", callback_data="menu:time"),
-            ],
-            [
-                InlineKeyboardButton("✅ Attend Now", callback_data="menu:attend"),
-                InlineKeyboardButton("🧪 Dry Run", callback_data="menu:dryrun"),
-            ],
-            [
-                InlineKeyboardButton("❌ Cancel", callback_data="menu:cancel"),
-                InlineKeyboardButton("🆔 My ID", callback_data="menu:id"),
-            ],
-        ]
-    )
-    await bot.send_message(
-        chat_id,
-        f"Hi! Your Telegram user ID is {user_id}.\n"
-        f"This chat's ID: {chat_id}.\n"
-        "Tap a button below or use a command.",
-        reply_markup=keyboard,
-    )
-
-
 def _calendar_keyboard(days: dict[str, str]) -> InlineKeyboardMarkup:
-    """Build a 14-day grid (2 weeks, 7 per row) plus a full-width Done button."""
-    today = date.today()
-    rows: list[list[InlineKeyboardButton]] = []
-    week: list[InlineKeyboardButton] = []
-    for i in range(14):
-        d = today + timedelta(days=i)
-        ds = d.isoformat()
-        label = f"{d.strftime('%a')} {d.day}"
-        status = days.get(ds)
-        if status == "normal":
-            label += " ✅"
-        elif status == "wfh":
-            label += " 🏠"
-        elif status == "mc":
-            label += " 🏥"
-        elif status == "none":
-            label += " ⌀"
-        week.append(InlineKeyboardButton(label, callback_data=f"sched:{ds}"))
-        if len(week) == 7:
-            rows.append(week)
-            week = []
-    if week:
-        rows.append(week)
-    rows.append([InlineKeyboardButton("✅ Done", callback_data="sched:done")])
-    return InlineKeyboardMarkup(rows)
+    today = datetime.now(SG).date()
+    buttons = []
+    for offset in range(14):
+        day = today + timedelta(days=offset)
+        status = days.get(day.isoformat(), "unset")
+        buttons.append(
+            InlineKeyboardButton(
+                f"{day:%a} {day.day} {status}", callback_data=f"sched:{day.isoformat()}"
+            )
+        )
+    return InlineKeyboardMarkup(
+        [buttons[:7], buttons[7:], [InlineKeyboardButton("Done", callback_data="sched:done")]]
+    )
 
 
-def _day_status_keyboard(date_str: str) -> InlineKeyboardMarkup:
+def _day_status_keyboard(day: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Normal", callback_data=f"set:{date_str}:normal"),
-                InlineKeyboardButton("WFH", callback_data=f"set:{date_str}:wfh"),
-                InlineKeyboardButton("MC", callback_data=f"set:{date_str}:mc"),
-                InlineKeyboardButton("Skip", callback_data=f"set:{date_str}:none"),
-            ],
-            [InlineKeyboardButton("← Back", callback_data=f"set:{date_str}:back")],
+                InlineKeyboardButton(label, callback_data=f"set:{day}:{status}")
+                for label, status in [
+                    ("Normal", "normal"),
+                    ("WFH", "wfh"),
+                    ("MC", "mc"),
+                    ("Skip", "none"),
+                    ("Back", "back"),
+                ]
+            ]
         ]
     )
 
 
-async def _schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state: BotState = context.application.bot_data["mdc"]
-    chat_id = update.effective_chat.id
-    uid = update.effective_user.id
-    users = load_users(state.users_path)
-    if uid not in users:
-        await context.bot.send_message(
-            chat_id,
-            f"Not registered — your Telegram user ID is {uid}. "
-            "Ask the operator to add it as a key in users.json.",
-        )
-        return
-    reason = _begin_session(state, context.application, chat_id)
-    if reason:
-        await context.bot.send_message(chat_id, reason)
-        return
-    interaction = state.interactions[chat_id]
-    interaction.task = asyncio.create_task(_schedule(interaction, uid))
-
-
-async def _schedule(interaction: Interaction, uid: int) -> None:
-    state = interaction._state
+async def _settings(interaction: Interaction, *, calendar: bool) -> None:
+    state, uid = interaction._state, interaction.chat_id
     try:
-        sched = load_schedules(state.schedules_path).get(uid, Schedule("09:00", {}))
-        keyboard = _calendar_keyboard(sched.days)
-        await interaction.send_calendar("📅 Pick a day to set its status:", keyboard)
-        await interaction.wait_for_done()
-    except asyncio.CancelledError:
-        await interaction.send("Schedule session cancelled.")
-        raise
+        if calendar:
+            interaction._expecting = "schedule"
+            interaction._future = asyncio.get_running_loop().create_future()
+            schedule = load_schedules(state.store.path).get(uid, Schedule("08:30", {}))
+            msg = await state.app.bot.send_message(
+                uid,
+                "Pick a day to set status. Changes save immediately. "
+                "OTP and MC input are still required.",
+                reply_markup=_calendar_keyboard(schedule.days),
+            )
+            interaction._cal_msg_id = msg.message_id
+            await asyncio.wait_for(interaction._future, state.base_cfg.prompt_timeout)
+        else:
+            raw = await interaction.ask_text(
+                "Enter HH:MM Singapore time, strictly before "
+                f"{state.base_cfg.attendance_deadline} (e.g. 08:30):",
+                "time",
+                state.base_cfg.prompt_timeout,
+            )
+            try:
+                parsed = datetime.strptime(raw, "%H:%M")
+                if parsed.strftime("%H:%M") != raw or raw >= state.base_cfg.attendance_deadline:
+                    raise ValueError("invalid schedule time")
+                save_schedule(state.store.path, uid, time=raw)
+            except ValueError:
+                await interaction.send(
+                    "Invalid time. Use HH:MM strictly before the attendance deadline. "
+                    "Send /time to try again."
+                )
+                return
+            if state.scheduler:
+                state.scheduler.replan()
+            await interaction.send(
+                f"Schedule time set to {raw} Asia/Singapore; no random jitter. "
+                "OTP/input must complete before the deadline."
+            )
     except TimeoutError:
         await interaction.send(
-            "Schedule session timed out — your changes were already saved as you made them."
+            "Settings session timed out. Calendar changes already saved remain saved."
         )
-    except Exception as exc:  # noqa: BLE001
-        log.exception("schedule session failed")
-        await interaction.send(f"Schedule failed: {exc}")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.error("Settings session failed; sensitive details omitted")
+        await interaction.send("Could not update settings.")
     finally:
-        state.active_chats.discard(interaction.chat_id)
-        state.interactions.pop(interaction.chat_id, None)
+        _release(interaction)
+
+
+async def _start_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, *, calendar: bool) -> None:
+    user = await _guard(update, context)
+    if user is None:
+        return
+    state: BotState = context.application.bot_data["mdc"]
+    try:
+        interaction = _begin_session(state, user.telegram_id)
+    except BusyRun:
+        await context.bot.send_message(user.telegram_id, "A session is active. Use /cancel first.")
+        return
+    interaction.task = asyncio.create_task(_settings(interaction, calendar=calendar))
+    interaction.task.add_done_callback(_task_done)
+
+
+async def _time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _start_settings(update, context, calendar=False)
+
+
+async def _schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _start_settings(update, context, calendar=True)
 
 
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state: BotState = context.application.bot_data["mdc"]
-    chat_id = update.effective_chat.id
-    interaction = state.interactions.get(chat_id)
-    if interaction and interaction.deliver_text(
-        update.message.text, message_id=update.message.message_id
-    ):
+    user = await _guard(update, context)
+    if user is None or update.message is None:
         return
+    state: BotState = context.application.bot_data["mdc"]
+    interaction = state.interactions.get(user.telegram_id)
+    message = update.message
+    text = message.text
+    if not isinstance(text, str):
+        return
+    reply_id = message.reply_to_message.message_id if message.reply_to_message else None
+    if interaction:
+        if interaction._expecting == "otp":
+            try:
+                accepted = interaction.deliver_otp(
+                    text,
+                    user_id=user.telegram_id,
+                    chat_id=message.chat_id,
+                    reply_to_message_id=reply_id,
+                )
+            except ValueError:
+                accepted = False
+            # Delete attempted OTP delivery, including invalid/stale replies, best effort.
+            with contextlib.suppress(TelegramError):
+                await message.delete()
+            if accepted:
+                return
+            await interaction.send(
+                "OTP not accepted. Reply to the CURRENT OTP prompt with exactly six ASCII digits."
+            )
+            return
+        if interaction.deliver_text(
+            text, user_id=user.telegram_id, chat_id=message.chat_id, reply_to_message_id=reply_id
+        ):
+            return
+    try:
+        validate_otp(text)
+    except ValueError:
+        pass
+    else:
+        with contextlib.suppress(TelegramError):
+            await message.delete()
     await context.bot.send_message(
-        chat_id,
-        "Send /start for the menu, /attend or /dry-run to start, or reply to the current prompt.",
+        user.telegram_id,
+        "No matching current prompt. Use /start or reply to the current prompt; "
+        "old replies are not accepted.",
     )
 
 
 async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await _guard(update, context)
+    if user is None:
+        return
     q = update.callback_query
+    if q is None or q.message is None:
+        return
     await q.answer()
     state: BotState = context.application.bot_data["mdc"]
-    chat_id = q.message.chat_id
-    interaction = state.interactions.get(chat_id)
-
-    if q.data == "sched:done":
-        if interaction and interaction.deliver_done():
-            with contextlib.suppress(BadRequest):
-                await q.edit_message_text("📅 Schedule session closed.")
-        else:
-            await context.bot.send_message(
-                chat_id, "That schedule session is no longer active."
+    interaction = state.interactions.get(user.telegram_id)
+    data = q.data or ""
+    if data.startswith("menu:"):
+        handlers = {
+            "menu:attend": _attend,
+            "menu:dryrun": _dry_run,
+            "menu:schedule": _schedule_cmd,
+            "menu:time": _time,
+            "menu:cancel": _cancel,
+        }
+        handler = handlers.get(data)
+        if handler:
+            await handler(update, context)
+        return
+    if interaction and interaction.deliver_choice(
+        data, user_id=user.telegram_id, chat_id=q.message.chat.id, message_id=q.message.message_id
+    ):
+        with contextlib.suppress(BadRequest):
+            await q.edit_message_text(f"Selected: {data}")
+        return
+    if (
+        not interaction
+        or interaction._expecting != "schedule"
+        or q.message.message_id != interaction._cal_msg_id
+    ):
+        await context.bot.send_message(user.telegram_id, "That button is no longer active.")
+        return
+    if data == "sched:done":
+        if interaction._future and not interaction._future.done():
+            interaction._future.set_result("done")
+        with contextlib.suppress(BadRequest):
+            await q.edit_message_text("Schedule session closed.")
+        return
+    today = datetime.now(SG).date()
+    valid_days = {(today + timedelta(days=i)).isoformat() for i in range(14)}
+    if data.startswith("sched:") and data[6:] in valid_days:
+        with contextlib.suppress(BadRequest):
+            await q.edit_message_text(
+                f"{data[6:]} — choose status:", reply_markup=_day_status_keyboard(data[6:])
             )
-    elif q.data.startswith("sched:"):
-        if interaction and interaction._expecting == "schedule":
-            day = q.data[6:]
-            with contextlib.suppress(BadRequest):
-                await q.edit_message_text(
-                    f"📅 {day} — choose status:",
-                    reply_markup=_day_status_keyboard(day),
-                )
-        else:
-            await context.bot.send_message(
-                chat_id, "That schedule session is no longer active."
-            )
-    elif q.data.startswith("set:"):
-        if interaction and interaction._expecting == "schedule":
-            _, day, status = q.data.split(":", 2)
-            uid = update.effective_user.id if update.effective_user else 0
-            if status == "back":
-                sched = load_schedules(state.schedules_path).get(
-                    uid, Schedule("09:00", {})
-                )
-                with contextlib.suppress(BadRequest):
-                    await q.edit_message_text(
-                        "📅 Pick a day to set its status:",
-                        reply_markup=_calendar_keyboard(sched.days),
-                    )
-            else:
-                save_schedule(state.schedules_path, uid, days={day: status})
-                if state.scheduler:
-                    state.scheduler.replan()
-                sched = load_schedules(state.schedules_path).get(
-                    uid, Schedule("09:00", {})
-                )
-                with contextlib.suppress(BadRequest):
-                    await q.edit_message_text(
-                        "📅 Pick a day to set its status:",
-                        reply_markup=_calendar_keyboard(sched.days),
-                    )
-        else:
-            await context.bot.send_message(
-                chat_id, "That schedule session is no longer active."
-            )
-    elif q.data.startswith("menu:"):
-        action = q.data[5:]
-        if action == "cancel":
-            await _cancel(update, context)
-        elif action == "id":
-            uid = update.effective_user.id if update.effective_user else "?"
-            await context.bot.send_message(
-                chat_id, f"Your Telegram user ID: {uid}\nThis chat's ID: {chat_id}"
-            )
-        elif chat_id in state.active_chats:
-            await context.bot.send_message(
-                chat_id, "A session is already in progress. /cancel to abort."
-            )
-        elif action == "attend":
-            await _start_run(update, context, dry_run=False)
-        elif action == "dryrun":
-            await _start_run(update, context, dry_run=True)
-        elif action == "schedule":
-            await _schedule_cmd(update, context)
-        elif action == "time":
-            await _time(update, context)
-    else:
-        if interaction and interaction.deliver_choice(q.data):
-            with contextlib.suppress(BadRequest):
-                await q.edit_message_text(f"Selected: {q.data}")
-        else:
-            await context.bot.send_message(
-                chat_id, "That button is no longer active."
+    elif data.startswith("set:"):
+        parts = data.split(":")
+        if (
+            len(parts) != 3
+            or parts[1] not in valid_days
+            or parts[2] not in {"normal", "wfh", "mc", "none", "back"}
+        ):
+            return
+        _, day, status = parts
+        if status != "back":
+            save_schedule(state.store.path, user.telegram_id, days={day: status})
+            if state.scheduler:
+                state.scheduler.replan()
+        schedule = load_schedules(state.store.path).get(user.telegram_id, Schedule("08:30", {}))
+        with contextlib.suppress(BadRequest):
+            await q.edit_message_text(
+                "Pick a day to set status:", reply_markup=_calendar_keyboard(schedule.days)
             )
 
 
 async def _cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await _guard(update, context)
+    if user is None:
+        return
     state: BotState = context.application.bot_data["mdc"]
-    chat_id = update.effective_chat.id
-    interaction = state.interactions.get(chat_id)
-    if not interaction:
-        await context.bot.send_message(chat_id, "Nothing to cancel.")
+    interaction = state.interactions.get(user.telegram_id)
+    if interaction is None:
+        await context.bot.send_message(user.telegram_id, "Nothing to cancel.")
         return
     interaction.clear_pending()
     if interaction.task:
         interaction.task.cancel()
-    await context.bot.send_message(chat_id, "Cancelling the current run...")
+    await context.bot.send_message(
+        user.telegram_id, "Cancelling. If submission began, verify the outcome before retrying."
+    )
 
 
 async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.error(
-        "Unhandled exception while handling update %s", update, exc_info=context.error
-    )
+    # Never dump updates, exception text, traceback locals, tokens, or OTPs.
+    log.error("Telegram handler failed; sensitive details omitted")
 
 
 async def _post_init(application: Application) -> None:
     state: BotState = application.bot_data["mdc"]
-    cfg = state.base_cfg
+    if state.base_cfg.otp_http_enabled:
 
-    otp_app = create_telegram_otp_app(
-        lambda chat_id, otp: _deliver_http_otp(state, chat_id, otp)
-    )
-    server = make_server(otp_app, cfg.telegram_otp_host, cfg.telegram_otp_port)
-    task = asyncio.create_task(serve_quietly(server))
-    state.otp_server = server
-    state.otp_server_task = task
+        def credentials() -> dict[str, str]:
+            return {
+                str(uid): user.otp_token
+                for uid, user in load_users(state.users_path).items()
+                if user.otp_token
+            }
 
-    for _ in range(20):
-        if server.started or task.done():
-            break
-        await asyncio.sleep(0.05)
-    if not server.started:
+        if credentials():
+            state.otp_server = OtpHttpServer(credentials, state.base_cfg.otp_http_port)
+            try:
+                await state.otp_server.start()
+            except BaseException:
+                await state.otp_server.stop()
+                raise
+
+    async def prepare(uid: int, status: str, deadline: datetime):
+        user = load_users(state.users_path).get(uid)
+        if user is None:
+            raise ValueError("scheduled user no longer authorised")
+        interaction = _begin_session(state, uid)
+        interaction.scheduled = True
+        interaction.task = asyncio.current_task()
         try:
-            await stop_server(server, task)
-        finally:
-            state.otp_server = None
-            state.otp_server_task = None
-        raise RuntimeError(
-            f"Telegram OTP server could not bind "
-            f"{cfg.telegram_otp_host}:{cfg.telegram_otp_port}"
-        )
+            remaining = (deadline - datetime.now(SG)).total_seconds()
+            if remaining <= 0:
+                raise TimeoutError("attendance deadline passed")
+            async with asyncio.timeout(remaining):
+                await interaction.send(
+                    "Scheduled assisted attendance is ready. "
+                    "Provide requested MC details and OTP before the deadline."
+                )
+                return await _collect(interaction, user, status=status)
+        except BaseException:
+            _release(interaction)
+            raise
 
-    log.info(
-        "Telegram OTP endpoint ready on %s:%s: POST /telegram/otp",
-        cfg.telegram_otp_host,
-        cfg.telegram_otp_port,
-    )
-
-    state.scheduler = Scheduler(state, cfg.schedules_path)
-    await state.scheduler.start()
-    log.info("Scheduler started")
+    async def notify(uid: int, text: str) -> None:
+        interaction = state.interactions.get(uid)
+        if interaction is not None and interaction.scheduled:
+            _release(interaction)
+        if uid in load_users(state.users_path):
+            await application.bot.send_message(uid, text)
 
     try:
-        await application.bot.set_my_commands(
-            [
-                BotCommand("start", "Register / show menu"),
-                BotCommand("schedule", "Schedule the next 2 weeks"),
-                BotCommand("time", "Set submission time"),
-                BotCommand("attend", "Submit attendance now"),
-                BotCommand("dry_run", "Fill Normal without submitting"),
-                BotCommand("cancel", "Abort the current run"),
-            ]
-        )
-    except Exception:  # noqa: BLE001
-        log.warning("Could not set bot command menu (non-fatal).")
+        state.scheduler = Scheduler(state.store, state.runner, state.base_cfg, prepare, notify)
+        await state.scheduler.start()
+        with contextlib.suppress(TelegramError):
+            await application.bot.set_my_commands(
+                [
+                    BotCommand("start", "Show private attendance menu"),
+                    BotCommand("schedule", "Schedule the next 14 days"),
+                    BotCommand("time", "Set Singapore schedule time"),
+                    BotCommand("attend", "Submit; explicit override argument for resubmission"),
+                    BotCommand("dry_run", "Fill and verify without submitting"),
+                    BotCommand("cancel", "Cancel current interaction/run"),
+                ]
+            )
+    except BaseException:
+        await _post_stop(application)
+        raise
+
+
+async def _post_stop(application: Application) -> None:
+    state: BotState = application.bot_data["mdc"]
+    tasks = {
+        interaction.task for interaction in state.interactions.values() if interaction.task is not None
+    }
+    for interaction in tuple(state.interactions.values()):
+        interaction.clear_pending()
+    for task in tasks:
+        task.cancel()
+    try:
+        if state.scheduler is not None:
+            await state.scheduler.stop()
+    finally:
+        try:
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            try:
+                await state.runner.shutdown()
+            finally:
+                try:
+                    if state.otp_server is not None:
+                        await state.otp_server.stop()
+                finally:
+                    for interaction in tuple(state.interactions.values()):
+                        _release(interaction)
 
 
 async def _post_shutdown(application: Application) -> None:
     state: BotState = application.bot_data["mdc"]
-    if state.scheduler is not None:
-        await state.scheduler.stop()
-        state.scheduler = None
-    if state.otp_server is None or state.otp_server_task is None:
-        return
     try:
-        await stop_server(state.otp_server, state.otp_server_task)
+        await _post_stop(application)
     finally:
-        state.otp_server = None
-        state.otp_server_task = None
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the mdcattendance Telegram bot.")
-    parser.add_argument(
-        "--headed",
-        action="store_true",
-        help="Show Chromium windows for attendance runs.",
-    )
-    return parser.parse_args()
+        state.store.close()
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    args = _parse_args()
+    parser = argparse.ArgumentParser(description="Run the private mdcattendance Telegram bot.")
+    parser.add_argument("--headed", action="store_true", help="Show Chromium windows.")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Transport logs can include the bot token in request URLs.
+    logging.getLogger("httpx").setLevel(logging.CRITICAL)
+    logging.getLogger("httpcore").setLevel(logging.CRITICAL)
     cfg = load_config()
     if args.headed:
         cfg = replace(cfg, headless=False)
     if not cfg.telegram_bot_token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN must be set (see .env.example).")
+        raise SystemExit("TELEGRAM_BOT_TOKEN must be provisioned locally.")
+    load_users(cfg.users_path)
+    store = StateStore(cfg.state_dir, cfg.retention_days)
+    runner = AttendanceRunner(cfg, store)
     app = (
         Application.builder()
         .token(cfg.telegram_bot_token)
         .post_init(_post_init)
+        .post_stop(_post_stop)
         .post_shutdown(_post_shutdown)
         .build()
     )
-    app.bot_data["mdc"] = BotState(
-        base_cfg=cfg,
-        users_path=cfg.users_path,
-        schedules_path=cfg.schedules_path,
-        interactions={},
-        active_chats=set(),
-        semaphore=asyncio.Semaphore(cfg.max_concurrent_runs),
-        app=app,
-    )
-    app.add_handler(CommandHandler("start", _start))
-    app.add_handler(CommandHandler("help", _start))
-    app.add_handler(CommandHandler("attend", _attend))
-    app.add_handler(CommandHandler("dry_run", _dry_run))
-    app.add_handler(CommandHandler("schedule", _schedule_cmd))
-    app.add_handler(CommandHandler("time", _time))
-    app.add_handler(
-        MessageHandler(filters.Regex(r"^/dry-run(?:@[A-Za-z0-9_]+)?\s*$"), _dry_run)
-    )
-    app.add_handler(CommandHandler("cancel", _cancel))
+    app.bot_data["mdc"] = BotState(cfg, cfg.users_path, {}, set(), app, store, runner)
+    for command, handler in [
+        ("start", _start),
+        ("help", _start),
+        ("attend", _attend),
+        ("dry_run", _dry_run),
+        ("schedule", _schedule_cmd),
+        ("time", _time),
+        ("cancel", _cancel),
+    ]:
+        app.add_handler(CommandHandler(command, handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^/dry-run(?:@[A-Za-z0-9_]+)?\s*$"), _dry_run))
     app.add_handler(CallbackQueryHandler(_on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     app.add_error_handler(_on_error)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(allowed_updates=["message", "callback_query"])
+    finally:
+        # run_polling invokes post_shutdown even when post_init fails.
+        store.close()
 
 
 if __name__ == "__main__":

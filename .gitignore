@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .venv/
 .env
+.env.*
+!.env.example
 users.json
 schedules.json
 form-answers.json
@@ -12,3 +14,5 @@ test-results/
 .playwright/
 .ruff_cache/
 *.pid
+state/
+.pytest_cache/

@@ -1,15 +1,35 @@
-"""Per-user submission schedule store for the Telegram bot.
-
-``schedules.json`` maps Telegram user ids to a submission time and a per-day
-status. The file is gitignored and tightened to 0600 on write. Reloaded on
-each schedule change so edits take effect without a restart.
-"""
+"""Validated schedules in StateStore's SQLite database, separate from its journal."""
 
 from __future__ import annotations
 
-import json
-import os
+import re
+import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from .storage import iso_day
+
+DEFAULT_SCHEDULE_TIME = "08:30"
+DAY_STATUSES = {"normal", "wfh", "mc", "none"}
+
+
+def validate_time(value: str) -> None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[0-2][0-9]:[0-5][0-9]", value) is None
+        or int(value[:2]) > 23
+    ):
+        raise ValueError("Schedule time must use HH:MM (00:00 to 23:59)")
+
+
+def _validate_days(days: dict[str, str]) -> None:
+    if not isinstance(days, dict):
+        raise ValueError("Schedule days must map ISO dates to attendance statuses")
+    for day, status in days.items():
+        iso_day(day)
+        if not isinstance(day, str) or not isinstance(status, str) or status not in DAY_STATUSES:
+            raise ValueError("Unsupported scheduled attendance status or date")
 
 
 @dataclass(frozen=True)
@@ -17,34 +37,27 @@ class Schedule:
     time: str
     days: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        validate_time(self.time)
+        _validate_days(self.days)
+
 
 def load_schedules(path: str) -> dict[int, Schedule]:
-    """Load ``schedules.json``. Missing file -> {} (no schedules).
-
-    Tolerates a missing ``"time"`` (defaults to ``"09:00"``) and a missing
-    ``"days"`` (defaults to ``{}``). Non-string day values are ignored.
-    """
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except FileNotFoundError:
+    """Read persisted schedules; never clear or reinterpret dispatch outcomes."""
+    file = Path(path).expanduser().resolve()
+    if not file.exists():
         return {}
-    schedules: dict[int, Schedule] = {}
-    for key, rec in raw.items():
-        try:
-            uid = int(key)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(rec, dict):
-            continue
-        t = str(rec.get("time", "09:00")).strip() or "09:00"
-        days: dict[str, str] = {}
-        days_raw = rec.get("days", {})
-        if isinstance(days_raw, dict):
-            for dk, dv in days_raw.items():
-                if isinstance(dv, str):
-                    days[str(dk)] = dv
-        schedules[uid] = Schedule(t, days)
+    with closing(sqlite3.connect(file.as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+        db.execute("BEGIN")
+        schedules = {
+            int(uid): Schedule(time)
+            for uid, time in db.execute("SELECT uid,time FROM schedules ORDER BY uid")
+        }
+        for uid, day, status in db.execute("SELECT uid,day,status FROM schedule_days ORDER BY uid,day"):
+            iso_day(day)
+            if status not in DAY_STATUSES:
+                raise ValueError("Unsupported scheduled attendance status")
+            schedules[int(uid)].days[day] = status
     return schedules
 
 
@@ -55,47 +68,27 @@ def save_schedule(
     time: str | None = None,
     days: dict[str, str] | None = None,
 ) -> None:
-    """Read-modify-write one user's schedule atomically; tighten to 0600.
-
-    If ``time`` is given it overwrites the stored time. If ``days`` is given
-    each key is merged into the stored days (setting a day to ``"none"`` keeps
-    the key so it renders as cleared).
-    """
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except FileNotFoundError:
-        raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-    key = str(uid)
-    rec = raw.get(key)
-    if not isinstance(rec, dict):
-        rec = {}
+    """Atomically merge one user's settings without modifying attempts or dispatches."""
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+        raise ValueError("User id must be a positive integer")
     if time is not None:
-        rec["time"] = time
+        validate_time(time)
     if days is not None:
-        existing = rec.get("days", {})
-        if not isinstance(existing, dict):
-            existing = {}
-        existing.update(days)
-        rec["days"] = existing
-    raw[key] = rec
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
-    _ensure_perms(path)
-
-
-def _ensure_perms(path: str) -> None:
-    """Tighten the schedule file to 0600 if it is more open."""
-    try:
-        mode = os.stat(path).st_mode & 0o777
-        if mode & 0o077:
-            os.chmod(path, 0o600)
-    except OSError:
-        pass
+        _validate_days(days)
+    file = Path(path).expanduser().resolve()
+    with closing(sqlite3.connect(file.as_uri() + "?mode=rw", uri=True, timeout=5)) as db:
+        db.execute("PRAGMA foreign_keys = ON")
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT OR IGNORE INTO schedules(uid,time) VALUES (?,?)",
+                (uid, DEFAULT_SCHEDULE_TIME),
+            )
+            if time is not None:
+                db.execute("UPDATE schedules SET time=? WHERE uid=?", (time, uid))
+            if days is not None:
+                db.executemany(
+                    """INSERT INTO schedule_days(uid,day,status) VALUES (?,?,?)
+                       ON CONFLICT(uid,day) DO UPDATE SET status=excluded.status""",
+                    [(uid, day, status) for day, status in days.items()],
+                )

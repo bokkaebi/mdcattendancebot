@@ -2,6 +2,7 @@
   "1095904267": {
     "singpass_id": "S1234567A",
     "singpass_password": "your-password-here",
-    "department": "Show Production (Including SDE Cap Devt)"
+    "department": "Show Production (Including SDE Cap Devt)",
+    "otp_token": ""
   }
 }

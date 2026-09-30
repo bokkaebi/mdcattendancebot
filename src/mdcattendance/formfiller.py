@@ -5,23 +5,22 @@ Field matching is accessibility-based so it survives DOM/class churn:
 * radio: question ``group`` -> option accessible name
 * checkbox: question ``group`` or unique option accessible name
 * text: ``textbox``/label accessible name
-* date: day/month/year ``group`` (retained for future profiles)
 
 Profiles are insertion-ordered. Answers are applied iteratively because FormSG
 mounts conditional questions only after preceding radio selections. Any expected
 answer left unapplied is fatal: the bot must never submit a partial profile.
 
-``--discover`` saves the authenticated form page's HTML (``Page.content``) to
-``form-page.html`` for inspection.
+Explicit discovery saves restricted HTML to the state diagnostics directory.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .attendance import Answers, AnswerValue
@@ -37,7 +36,7 @@ def _question_name(title: str) -> re.Pattern[str]:
     return re.compile(rf"^(?:\d+\.\s*)?{escaped_title}(?:\s*\*)?$", re.IGNORECASE)
 
 
-async def _resolve_radiogroup(page: Page, key: str):
+async def _resolve_radiogroup(page: Page, key: str) -> Locator | None:
     """Resolve by question name; option values repeat across conditional fields."""
     groups = page.get_by_role("radiogroup", name=_question_name(key))
     if await _count(groups) == 1:
@@ -45,20 +44,21 @@ async def _resolve_radiogroup(page: Page, key: str):
     return None
 
 
-async def _count(loc) -> int:
+async def _count(loc: Locator) -> int:
     try:
         return await loc.count()
     except Exception:
         return 0
 
 
-async def _all_exist(locators: list) -> bool:
+async def _all_exist(locators: list[Locator]) -> bool:
     for locator in locators:
-        if not await _count(locator):
+        if await _count(locator) != 1:
             return False
     return True
 
-async def _input_by_value(container, input_type: str, value: str):
+
+async def _input_by_value(container: Locator, input_type: str, value: str) -> Locator | None:
     inputs = container.locator(f'input[type="{input_type}"]')
     for index in range(await _count(inputs)):
         candidate = inputs.nth(index)
@@ -67,65 +67,70 @@ async def _input_by_value(container, input_type: str, value: str):
     return None
 
 
-async def apply_answer(page: Page, key: str, value: AnswerValue) -> bool:
-    """Apply one answer to a currently mounted field. Return whether applied."""
-    values = [str(v) for v in (value if isinstance(value, list) else [value])]
-
+async def _resolve_answer(
+    page: Page, key: str, value: AnswerValue
+) -> tuple[str, list[Locator], Locator | None] | None:
+    values = value if isinstance(value, list) else [value]
     radiogroup = await _resolve_radiogroup(page, key)
     if radiogroup is not None:
-        radios = [await _input_by_value(radiogroup, "radio", v) for v in values]
-        if all(radio is not None for radio in radios):
-            for radio in radios:
-                await radio.check(force=True)
-            return True
-
+        if len(values) != 1:
+            return None
+        radios: list[Locator] = []
+        for option in values:
+            radio = await _input_by_value(radiogroup, "radio", option)
+            if radio is None:
+                return None
+            radios.append(radio)
+        return "radio", radios, radiogroup.locator('input[type="radio"]')
     group = page.get_by_role("group", name=_question_name(key))
-    if await _count(group):
+    if await _count(group) == 1:
         checkboxes = [group.get_by_role("checkbox", name=v, exact=True) for v in values]
         if await _all_exist(checkboxes):
-            for checkbox in checkboxes:
-                await checkbox.first.check(force=True)
-            return True
-
+            return "checkbox", checkboxes, group.get_by_role("checkbox")
     # Acknowledgements have duplicate question titles but unique option text.
     checkboxes = [page.get_by_role("checkbox", name=v, exact=True) for v in values]
     if await _all_exist(checkboxes):
-        for checkbox in checkboxes:
-            await checkbox.first.check(force=True)
-        return True
+        return "checkbox", checkboxes, None
     textbox = page.get_by_role("textbox", name=_question_name(key))
-    if await _count(textbox) == 1:
-        await textbox.fill(values[0])
-        return True
-    return bool(await _fill_date_group(page, key, values[0]))
+    if isinstance(value, str) and await _count(textbox) == 1:
+        return "text", [textbox], None
+    return None
 
 
-async def _fill_date_group(page: Page, title: str, value: str) -> bool:
-    match = re.fullmatch(r"\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*", value)
-    if match:
-        year, month, day = match.group(1), match.group(2), match.group(3)
-    else:
-        match = re.fullmatch(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*", value)
-        if not match:
-            return False
-        day, month, year = match.group(1), match.group(2), match.group(3)
-
-    group = page.get_by_role("group", name=_question_name(title))
-    if not await _count(group):
+async def apply_answer(page: Page, key: str, value: AnswerValue) -> bool:
+    """Apply one answer using the same resolution as strict read-back."""
+    resolved = await _resolve_answer(page, key, value)
+    if resolved is None:
         return False
-    selects = group.get_by_role("combobox")
-    if await _count(selects) >= 3:
-        await selects.nth(0).select_option(day)
-        await selects.nth(1).select_option(str(int(month)))
-        await selects.nth(2).select_option(year)
-        return True
-    inputs = group.get_by_role("spinbutton")
-    if await _count(inputs) >= 3:
-        await inputs.nth(0).fill(day)
-        await inputs.nth(1).fill(str(int(month)))
-        await inputs.nth(2).fill(year)
-        return True
-    return False
+    kind, controls, _ = resolved
+    for control in controls:
+        if kind == "text":
+            if not isinstance(value, str):
+                return False
+            await control.fill(value)
+        else:
+            await control.check(force=True)
+    return True
+
+
+async def verify_form(page: Page, answers: Answers) -> None:
+    """Read, never repair, every expected answer; fail closed on any mismatch."""
+    for key, value in answers.items():
+        resolved = await _resolve_answer(page, key, value)
+        if resolved is None:
+            raise RuntimeError(f"refusing to submit; expected field is missing: {key}")
+        kind, controls, siblings = resolved
+        if kind == "text":
+            matches = await controls[0].input_value() == value
+        else:
+            matches = all([await control.is_checked() for control in controls])
+            if siblings is not None:
+                checked = sum(
+                    [await siblings.nth(index).is_checked() for index in range(await siblings.count())]
+                )
+                matches = matches and checked == len(controls)
+        if not matches:
+            raise RuntimeError(f"refusing to submit; answer changed: {key}")
 
 
 async def fill_form(page: Page, answers: Answers) -> None:
@@ -139,8 +144,8 @@ async def fill_form(page: Page, answers: Answers) -> None:
                 applied = await apply_answer(page, key, value)
             except PlaywrightTimeoutError:
                 applied = False
-            except Exception as error:  # noqa: BLE001
-                log.warning("error filling '%s': %s", key, error)
+            except Exception:  # noqa: BLE001
+                log.warning("unable to fill expected field '%s'", key)
                 applied = False
             if applied:
                 log.info("filled '%s'", key)
@@ -159,9 +164,11 @@ async def fill_form(page: Page, answers: Answers) -> None:
         raise RuntimeError(f"refusing to submit; expected answers were not applied: {missing}")
 
 
-async def discover_form(page: Page, out_path: str = "form-page.html") -> None:
-    """Save the authenticated form page's HTML (``Page.content``) to ``out_path``."""
-    log.info("saving form HTML -> %s", out_path)
+async def discover_form(page: Page, out_path: str) -> None:
+    """Explicitly save authenticated HTML without following symlinks, mode 0600."""
     html = await page.content()
-    Path(out_path).write_text(html, encoding="utf-8")
-    log.info("wrote form HTML (%d bytes) -> %s", len(html), out_path)
+    path = Path(out_path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(html)
+    log.info("discovery saved to restricted state diagnostics")

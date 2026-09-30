@@ -18,26 +18,43 @@ Screenshot source of truth:
 ## Architecture & Data Flow
 
 ```text
-CLI profile + MC details (if needed)
-  -> FormSG "Log in with Singpass"
-  -> Singpass "Use password"
-  -> credentials from .env
-  -> OTP from terminal (default) or HTTP bridge (--http-otp)
-  -> consent "I Agree"
-  -> wait for FormSG SPA to settle
-  -> apply ordered attendance profile
-  -> submit "Submit now" (skipped by --dry-run)
+CLI / allowlisted private Telegram chat / SQLite scheduler
+  -> validate ordered attendance profile and required MC details
+  -> shared AttendanceRunner + cross-process flock
+  -> sandboxed headless bundled Chromium (Asia/Singapore)
+  -> Singpass password + bounded owning-user OTP + MyInfo consent
+  -> apply answers -> verify read-back
+  -> persist submitting -> click "End of form. Submit now" -> verify confirmation
+  -> persist outcome -> close browser
 ```
 
 - `attendance.py` owns exact screenshot-derived labels and ordered profiles.
   Order matters: Department -> Status -> conditionally mounted questions -> acknowledgements.
-- `bot.py` owns navigation/authentication and delegates OTP/profile filling.
-- `formfiller.py` is generic and strict. It targets accessible roles/names,
-  retries conditionally mounted fields, and refuses to submit if any expected
-  answer was not applied.
-- `otp.py` defines `OtpProvider`; `CliOtpProvider` uses
-  `asyncio.to_thread(input, ...)`. `server.OtpBridge` is the optional HTTP
-  implementation.
+- `runner.py` owns account/date duplicate protection, one active browser, total
+  timeout, cancellation and conservative outcome recording.
+- `storage.py` stores attempts, schedules and dispatch journal in private SQLite.
+  Unknown submissions never auto-retry; there is no exactly-once guarantee.
+- `scheduler.py` calls the runner directly, not Telegram handlers. Scheduled work
+  is assisted submission: OTP and MC details still require the owner.
+- `bot.py` owns sandboxed browser navigation/authentication and cleanup.
+- `formfiller.py` strictly applies and verifies every expected answer.
+- `otp.py` provides bounded terminal OTP and six-ASCII-digit validation.
+- `telegram_bot.py` uses long polling, locally provisioned restricted credentials,
+  a private-chat allowlist and prompt-bound OTP. No credential onboarding exists.
+- `server.py` optionally provides an aiohttp OTP receiver bound only to
+  `127.0.0.1` (default 8765), off by default. Bearer auth identifies the owner:
+  GET `/otp/pending`, then POST `/otp` with exactly `request_id` and `otp`.
+  CLI uses `OTP_HTTP_TOKEN`; Telegram uses unique per-owner `otp_token` values
+  reloaded from the users file per request. Owners without tokens remain manual.
+  CLI `--http-otp` forces HTTP-only OTP; env enablement races manual input.
+  Consume/expire IDs on manual/HTTP completion, timeout, cancellation and shutdown;
+  never queue early OTP or retry a late SMS against a new ID. Bound bodies,
+  read time and request rate; use no-store replies and no secret/request logging.
+  Legacy unauthenticated endpoints are unsupported.
+- Optional operator-installed ngrok uses an assigned free HTTPS dev domain and a
+  separate agent authtoken; no VPN or inbound firewall opening. Disable local
+  inspection and cloud Full Capture separately. ngrok terminates TLS and can
+  access OTP data. Main bot operation/manual OTP must not depend on the tunnel.
 
 FormSG is a React SPA. After redirecting back from MyInfo consent, the bot
 waits for `form[novalidate] div[role="radiogroup"]` to mount — never
@@ -52,11 +69,16 @@ waits for `form[novalidate] div[role="radiogroup"]` to mount — never
 | `src/mdcattendance/bot.py` | Playwright Singpass -> FormSG workflow |
 | `src/mdcattendance/formfiller.py` | radios, checkboxes, text/date filling; strict completion invariant |
 | `src/mdcattendance/otp.py` | terminal OTP provider protocol/implementation |
-| `src/mdcattendance/server.py` | optional FastAPI HTTP OTP bridge |
+| `src/mdcattendance/server.py` | optional owner/run-bound authenticated loopback OTP receiver |
 | `src/mdcattendance/config.py` | frozen env-backed `Config` |
 | `src/mdcattendance/__main__.py` | argparse and async orchestration |
 | `website/snapshots/*.png` | selected-answer source of truth |
-| `form-page.html` | gitignored `--discover` output |
+| `src/mdcattendance/runner.py` | shared execution, process lock and submission safeguards |
+| `src/mdcattendance/storage.py` | private SQLite attempts, schedules and dispatch journal |
+| `src/mdcattendance/scheduler.py` | deterministic Singapore assisted scheduling before 09:00 |
+| `src/mdcattendance/telegram_bot.py` | private allowlisted long-polling interface |
+| `state/diagnostics/form-*.html` | explicit restricted discovery output with TTL |
+| `DEPLOYMENT.md`, `deploy/mdcattendance.service` | Ubuntu 24.04 deployment and target gates |
 
 ## Development Commands
 
@@ -69,26 +91,19 @@ uv run mdcattendance --day-type normal
 uv run mdcattendance --day-type wfh
 uv run mdcattendance --day-type mc           # prompts clinic + appointment timing
 uv run mdcattendance --headed --day-type mc
-uv run mdcattendance --headed --dry-run --day-type normal  # fill, wait 30s, never submit
-uv run mdcattendance --discover              # auth, save form-page.html, no submit
-uv run mdcattendance --preflight              # no credentials/OTP submitted
-uv run mdcattendance --http-otp --day-type normal
+uv run mdcattendance --headed --dry-run --day-type normal  # fill and verify, never submit
+uv run mdcattendance --discover              # auth, private diagnostic HTML, no submit
+uv run mdcattendance --preflight             # no credentials/OTP submitted
+uv run mdcattendance-tg                      # restricted local allowlist, long polling
 
 uvx ruff check src
 ```
 
-With `--http-otp`, the external service calls:
-
-```sh
-curl -X POST http://127.0.0.1:8080/otp \
-  -H 'Content-Type: application/json' \
-  -d '{"otp":"123456"}'
-```
 
 ## Code Conventions & Common Patterns
 
-- Python 3.14, `uv`, Playwright async API, FastAPI/uvicorn only for
-  `--http-otp`.
+- Python >=3.11 (Ubuntu 24.04 deployment uses 3.12), `uv`, Playwright async API,
+  python-telegram-bot, stdlib SQLite and aiohttp for optional OTP HTTP.
 - Use accessible Playwright locators (`get_by_role`, `get_by_label`), never
   generated Chakra CSS classes.
 - FormSG radio questions use `role="radiogroup"` with names such as
@@ -101,7 +116,8 @@ curl -X POST http://127.0.0.1:8080/otp \
 - Missing expected answers are fatal. Never downgrade the strict failure to a
   warning or submit a partial form.
 - `Config` is frozen; CLI overrides use `dataclasses.replace`.
-- `.env`, `form-page.html`, and local answer artifacts remain gitignored.
+- Restricted `.env`/`MDCATTENDANCE_ENV_FILE`, `users.json`, state and diagnostics
+  remain uncommitted. Never read real local credentials during development.
 
 ## Important Files
 
@@ -112,24 +128,26 @@ curl -X POST http://127.0.0.1:8080/otp \
 
 ## Runtime / Tooling Preferences
 
-- Run commands through `uv run`; do not invoke the venv interpreter directly.
-- Playwright's bundled Chromium uses the Ubuntu 24.04 fallback on this CachyOS
-  machine. `CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` opts into system Chromium.
+- Development commands use `uv run`; deployed systemd uses the single synced
+  environment's entry point directly, without syncing at startup.
+- Use bundled Chromium with sandboxing and user namespaces. Ubuntu 24.04 is the
+  supported VPS; do not equate local launch success with target Singpass acceptance.
 - Shell is fish. Keep examples portable or explicitly fish-compatible.
 - Never commit Singpass credentials, discovered authenticated HTML, or personal
   attendance answers.
 
 ## Testing & QA
 
-Verification is behavioral and focused:
+Verification is behavioral and focused. Do not treat historical local results as
+proof of the current target VPS:
 
-- Live preflight confirms FormSG -> Singpass -> password fields.
-- A real authenticated run confirmed OTP submission, `I Agree`, and redirect
-  back to authenticated FormSG.
-- The saved FormSG DOM confirmed `radiogroup` semantics; screenshot profiles
-  confirm exact selected values.
-- CLI profile/MC prompts and ruff have been smoke-checked.
-
-The remaining end-to-end proof is a real profile fill + submit. Keep any further
-verification narrowly targeted; do not add broad test scaffolding for this
-personal automation script.
+- Run focused regressions for missing/changed answers, stale OTP, schedule journal
+  restart/replan behavior and unknown outcomes without automatic retry.
+- Exercise a sandboxed headless browser and verify browser teardown on completion,
+  cancellation and timeout.
+- On the actual VPS, pass preflight and authenticated profile dry-run before
+  enabling schedules. Stop if Singpass rejects the environment.
+- Submit only with explicit operator authorization; verify real confirmation.
+- Measure whole-service peak memory/tasks during login, OTP waiting and filling
+  before imposing cgroup limits. Follow `DEPLOYMENT.md` for bounded logs/state,
+  diagnostic TTL, shutdown and clean JSON-to-SQLite cutover.

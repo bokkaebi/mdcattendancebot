@@ -1,146 +1,205 @@
-"""CLI entry point for the Singpass attendance flow.
-
-By default the OTP is prompted in this terminal (``CliOtpProvider``). Use
-``--http-otp`` to instead receive it via the HTTP bridge (``POST /otp``).
-"""
+"""Terminal attendance interface; every browser mode uses the shared runner."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 from dataclasses import replace
 
-from .attendance import Answers, DayType, build_answers, choose_day_type
-from .bot import run_flow
-from .config import Config, load_config
-from .otp import CliOtpProvider, OtpProvider
-from .server import OtpBridge, create_app, make_server, serve_quietly, stop_server
-
-log = logging.getLogger("mdcattendance")
-
-
-def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+from .attendance import (
+    Answers,
+    DayType,
+    build_answers,
+    choose_day_type,
+    validate_answers,
+)
+from .config import load_config
+from .otp import CliOtpProvider, OtpProvider, validate_otp_token
+from .runner import AttendanceRunner, BusyRun, DuplicateRun
+from .server import OtpHttpServer
+from .storage import StateStore
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="mdcattendance",
-        description="Singpass attendance form auto-fill bot with an OTP step.",
+        prog="mdcattendance", description="Bounded Singpass attendance submission."
     )
-    parser.add_argument(
-        "--day-type",
-        choices=[day_type.value for day_type in DayType],
-        help="attendance profile; prompts when omitted (normal, wfh, mc)",
-    )
+    parser.add_argument("--day-type", choices=[kind.value for kind in DayType])
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
-        "--discover",
-        action="store_true",
-        help="save the authenticated form HTML; submit nothing",
+        "--discover", action="store_true", help="save restricted form diagnostics; do not submit"
     )
     mode.add_argument(
-        "--preflight",
-        action="store_true",
-        help="verify selectors up to the credential form; do not log in or ask for OTP",
+        "--preflight", action="store_true", help="check login selectors without credentials"
     )
     mode.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="authenticate and fill the selected profile without submitting",
+        "--dry-run", action="store_true", help="authenticate, fill and verify without submitting"
     )
-    parser.add_argument(
-        "--headed",
-        action="store_true",
-        help="show the browser window (default: headless)",
-    )
+    parser.add_argument("--headed", action="store_true", help="show the browser window")
+    parser.add_argument("--otp-timeout", type=float, help="maximum seconds for OTP delivery")
     parser.add_argument(
         "--http-otp",
         action="store_true",
-        help="receive the OTP via the HTTP bridge (POST /otp) instead of a terminal prompt",
+        help="receive OTP only by authenticated phone POST; profile/MC prompts remain terminal input",
     )
+    parser.add_argument("--state-dir", help="shared persistent state directory")
     parser.add_argument(
-        "--otp-timeout",
-        type=float,
-        default=None,
-        help="seconds to wait for the OTP (HTTP bridge only; ignored for the terminal prompt)",
+        "--override",
+        action="store_true",
+        help="intentionally permit a duplicate submission; check prior outcomes first",
     )
     return parser.parse_args()
 
 
+async def amain(args: argparse.Namespace) -> int:
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    received_signal: list[int] = []
 
+    def stop(signum: int) -> None:
+        received_signal.append(signum)
+        if task is not None:
+            task.cancel()
 
-async def amain() -> None:
-    _setup_logging()
-    args = _parse_args()
-    cfg: Config = load_config()
-
-    if args.discover:
-        cfg = replace(cfg, discover=True)
-    if args.preflight:
-        cfg = replace(cfg, preflight=True)
-    if args.dry_run:
-        cfg = replace(cfg, dry_run=True)
-    if args.headed:
-        cfg = replace(cfg, headless=False)
-    if args.otp_timeout is not None:
-        cfg = replace(cfg, otp_timeout=args.otp_timeout)
-
-    if not cfg.preflight and (not cfg.singpass_id or not cfg.singpass_password):
-        raise SystemExit(
-            "SINGPASS_ID and SINGPASS_PASSWORD must be set in .env (see .env.example). "
-            "Use --preflight to verify selectors without credentials."
-        )
-
-    answers: Answers = {}
-    if not cfg.preflight and not cfg.discover:
-        day_type = await choose_day_type(args.day_type)
-        log.info("attendance day type: %s", day_type.value)
-        answers = await build_answers(day_type)
-
-    otp_provider: OtpProvider
-    server = None
-    server_task = None
-
-    if args.http_otp and not cfg.preflight:
-        bridge = OtpBridge()
-        app = create_app(bridge)
-        server = make_server(app, cfg.otp_host, cfg.otp_port)
-        server_task = asyncio.create_task(serve_quietly(server))
-        await asyncio.sleep(0.8)
-        if not server.started:
-            raise SystemExit(
-                f"OTP bridge could not bind {cfg.otp_host}:{cfg.otp_port} "
-                "(port in use?); set OTP_PORT in .env"
-            )
-        log.info(
-            "OTP bridge ready: POST http://%s:%s/otp  (GET /health)",
-            cfg.otp_host,
-            cfg.otp_port,
-        )
-        otp_provider = bridge
-    else:
-        otp_provider = CliOtpProvider()
-        if not cfg.preflight:
-            log.info("OTP will be prompted in this terminal when the 2FA step is reached")
-
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(signum, stop, signum)
+    store = None
+    runner = None
+    receiver = None
     try:
-        await run_flow(cfg, otp_provider, answers)
+        cfg = load_config()
+        changes = {}
+        if args.discover or args.preflight or args.dry_run:
+            changes.update(discover=args.discover, preflight=args.preflight, dry_run=args.dry_run)
+        if args.headed:
+            changes["headless"] = False
+        if args.otp_timeout is not None:
+            changes["otp_timeout"] = args.otp_timeout
+        if args.state_dir is not None:
+            changes["state_dir"] = args.state_dir
+        if getattr(args, "http_otp", False):
+            changes["otp_http_enabled"] = True
+        cfg = replace(cfg, **changes)
+        if not cfg.preflight and (not cfg.singpass_id or not cfg.singpass_password):
+            print(
+                "Credentials are required for this mode; provision a restricted local env file. "
+                "Use --preflight without credentials.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.override and (cfg.preflight or cfg.discover or cfg.dry_run):
+            print("--override is only valid for an intentional submission.", file=sys.stderr)
+            return 2
+        otp_provider: OtpProvider = CliOtpProvider()
+        if cfg.otp_http_enabled and not cfg.preflight:
+            validate_otp_token(cfg.otp_http_token)
+            receiver = OtpHttpServer(lambda: {"cli": cfg.otp_http_token}, cfg.otp_http_port)
+            await receiver.start()
+            otp_provider = receiver.provider(
+                "cli", None if getattr(args, "http_otp", False) else otp_provider
+            )
+            print("OTP receiver ready; phone delivery uses authenticated /otp/pending and /otp POST.")
+        answers: Answers = {}
+        if not cfg.preflight and not cfg.discover:
+            async with asyncio.timeout(cfg.prompt_timeout):
+                day_type = await choose_day_type(args.day_type, timeout=cfg.prompt_timeout)
+                answers = await build_answers(day_type, timeout=cfg.prompt_timeout)
+                validate_answers(answers)
+        store = StateStore(cfg.state_dir, cfg.retention_days)
+        runner = AttendanceRunner(cfg, store)
+        result = await runner.run(cfg, otp_provider, answers, override=args.override)
+        if result.status == "unknown":
+            print(
+                "UNKNOWN: submission may have reached FormSG. Check the form outcome manually; "
+                "do not retry automatically.",
+                file=sys.stderr,
+            )
+            return 1
+        if result.status == "confirmed":
+            print("Attendance submission confirmed.")
+            return 0
+        expected = (
+            "preflight"
+            if cfg.preflight
+            else "discovered"
+            if cfg.discover
+            else "dry_run"
+            if cfg.dry_run
+            else "confirmed"
+        )
+        if result.status == expected:
+            print(
+                {
+                    "preflight": "Preflight completed; no login or submission performed.",
+                    "discovered": "Discovery completed; no submission performed.",
+                    "dry_run": "Dry-run completed; no submission performed.",
+                }[result.status]
+            )
+            return 0
+        print(f"Run outcome: {result.status}. No confirmation was obtained.", file=sys.stderr)
+        return 1
+    except BusyRun:
+        print("Another attendance run is active; this request was not started.", file=sys.stderr)
+        return 1
+    except DuplicateRun:
+        print(
+            "Duplicate submission blocked. Check the prior outcome; use --override only for an "
+            "intentional resubmission.",
+            file=sys.stderr,
+        )
+        return 1
+    except asyncio.CancelledError:
+        print(
+            "Run cancelled; consult the persistent attempt journal before resubmitting.", file=sys.stderr
+        )
+        return 128 + (received_signal[0] if received_signal else signal.SIGINT)
+    except TimeoutError:
+        print("Input or run timed out; no successful submission is claimed.", file=sys.stderr)
+        return 1
+    except (ValueError, OSError, EOFError):
+        print(
+            "Configuration or terminal input is invalid/unavailable; check local settings and "
+            "secret-file permissions.",
+            file=sys.stderr,
+        )
+        return 2
+    except Exception:
+        print(
+            "Run failed; no successful submission is claimed. Consult the persistent attempt journal.",
+            file=sys.stderr,
+        )
+        return 1
     finally:
-        if server is not None and server_task is not None:
-            await stop_server(server, server_task)
+        # A second signal must not interrupt browser cleanup or journal updates.
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(signum)
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            if runner is not None:
+                await runner.shutdown()
+        finally:
+            try:
+                if receiver is not None:
+                    await receiver.stop()
+            finally:
+                if store is not None:
+                    store.close()
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(
+                    signum, signal.default_int_handler if signum == signal.SIGINT else signal.SIG_DFL
+                )
 
 
 def main() -> None:
+    args = _parse_args()  # --help must never load credentials or open state.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
-        asyncio.run(amain())
+        raise SystemExit(asyncio.run(amain(args)))
     except KeyboardInterrupt:
-        sys.exit(130)
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

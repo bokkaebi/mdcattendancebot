@@ -1,0 +1,14 @@
+# Install as /etc/mdcattendance/ngrok.yml, root:mdcattendance, mode 0640.
+# Provision the ngrok account token and its automatically assigned dev domain locally.
+version: 3
+agent:
+  authtoken: YOUR_NGROK_AUTHTOKEN
+  inspect_db_size: -1
+  web_addr: false
+# Cloud Full Capture is separate: keep it OFF in the ngrok dashboard.
+# ngrok terminates TLS and can access OTP traffic; local settings do not prevent that.
+endpoints:
+  - name: otp
+    url: https://YOUR-ASSIGNED.ngrok-free.app
+    upstream:
+      url: http://127.0.0.1:8765

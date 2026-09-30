@@ -1,0 +1,39 @@
+[Unit]
+Description=Headless attendance bot (Telegram long polling)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=mdcattendance
+Group=mdcattendance
+WorkingDirectory=/opt/mdcattendance
+Environment=MDCATTENDANCE_ENV_FILE=/etc/mdcattendance/env
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/mdcattendance/browsers
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/mdcattendance/.venv/bin/mdcattendance-tg
+Restart=on-failure
+RestartSec=10
+StateDirectory=mdcattendance
+StateDirectoryMode=0700
+UMask=0077
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=45
+SendSIGKILL=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/mdcattendance
+# Chromium needs its user-namespace sandbox: do not add RestrictNamespaces,
+# PrivateUsers, or disable the browser sandbox to get past a host policy failure.
+TasksMax=infinity
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target
