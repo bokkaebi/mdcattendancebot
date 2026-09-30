@@ -109,6 +109,15 @@ return `409`. Do not fetch a fresh ID to retry a late SMS. See deployment guidan
 for all responses, privacy settings and manual fallback. Legacy unauthenticated
 forwarding endpoints are unsupported.
 
+OTP troubleshooting: `OTP page ready; waiting for OTP delivery` means the browser
+detected supported OTP inputs. Until then, no HTTP OTP request is pending. If the
+OTP page is visible but that log never appears, inspect its input attributes;
+the detector accepts one input with the user-reported exact label
+`Enter 6-digit OTP code` or `autocomplete="one-time-code"`, or six
+`maxlength="1" inputmode="numeric"` inputs. Detection and entry use the same
+supported controls; unrelated telephone inputs are not accepted. Use headed mode
+and a dry-run.
+
 ## State, outcomes and duplicates
 
 SQLite state lives in `STATE_DIR` (default `state/`, mode 0700) and holds attempts, schedules and

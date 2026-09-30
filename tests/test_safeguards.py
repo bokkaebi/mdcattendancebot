@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright
 
 from mdcattendance.attendance import NORMAL_ANSWERS
+from mdcattendance.bot import SINGPASS_HOST, _enter_otp, _wait_for_otp_page
 from mdcattendance.config import Config
 from mdcattendance.formfiller import fill_form, verify_form
 from mdcattendance.runner import AttendanceRunner, DuplicateRun
@@ -91,6 +92,35 @@ class FormReadbackTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     value,
                 )
+
+    async def test_reported_singpass_otp_label_without_autocomplete_is_supported(self):
+        await self.page.route(
+            f"https://{SINGPASS_HOST}/**",
+            lambda route: route.fulfill(
+                content_type="text/html",
+                body="""
+                    <input type="hidden" value="unchanged">
+                    <input type="tel" maxlength="6" aria-label="Enter 6-digit OTP code">
+                    <input type="tel" maxlength="6" aria-label="Phone number">
+                """,
+            ),
+        )
+        await self.page.goto(f"https://{SINGPASS_HOST}/offline-otp")
+        await _wait_for_otp_page(self.page, timeout_ms=1000)
+        await _enter_otp(self.page, "123456")
+        self.assertEqual(
+            await self.page.get_by_label("Enter 6-digit OTP code", exact=True).input_value(),
+            "123456",
+        )
+        self.assertEqual(await self.page.get_by_label("Phone number").input_value(), "")
+        self.assertEqual(await self.page.locator('input[type="hidden"]').input_value(), "unchanged")
+        await self.page.get_by_label("Enter 6-digit OTP code", exact=True).evaluate(
+            "(input) => input.removeAttribute('aria-label')"
+        )
+        with self.assertRaises(RuntimeError):
+            await _wait_for_otp_page(self.page, timeout_ms=300)
+        with self.assertRaises(RuntimeError):
+            await _enter_otp(self.page, "654321")
 
 
 class DurableRunTests(unittest.IsolatedAsyncioTestCase):

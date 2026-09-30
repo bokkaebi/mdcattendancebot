@@ -1,8 +1,9 @@
 """Sandboxed Singpass/FormSG execution with fail-closed submission.
 
 Password selectors and FormSG submit/confirmation names come from captured DOM.
-OTP controls remain inferred: accept only explicit OTP controls and submit buttons,
-never arbitrary textboxes or keyboard fallback. Discovery is explicit and restricted.
+OTP input labels include user-reported DOM; other controls remain inferred.
+Accept only explicit OTP controls, never arbitrary textboxes or keyboard fallback.
+Discovery is explicit and restricted.
 """
 
 from __future__ import annotations
@@ -198,6 +199,7 @@ async def _login_with_singpass(page: Page, cfg: Config, otp: OtpProvider) -> Non
     await page.get_by_role("button", name="Submit password for Singpass login", exact=True).click()
     log.info("credentials submitted; waiting for OTP page")
     await _wait_for_otp_page(page, timeout_ms=60000)
+    log.info("OTP page ready; waiting for OTP delivery")
     code = validate_otp(await otp.wait_for_otp(timeout=cfg.otp_timeout))
     log.info("OTP received; entering it")
     await _enter_otp(page, code)
@@ -205,12 +207,14 @@ async def _login_with_singpass(page: Page, cfg: Config, otp: OtpProvider) -> Non
 
 
 async def _wait_for_otp_page(page: Page, *, timeout_ms: int) -> None:
-    # INFERRED: explicit one-time-code input or exactly six single-digit inputs.
+    # USER-REPORTED: "Enter 6-digit OTP code"; INFERRED: autocomplete or six digits.
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         if urlparse(page.url).hostname != SINGPASS_HOST:
             raise RuntimeError("unexpected authentication page while waiting for OTP")
-        single = page.locator('input[autocomplete="one-time-code"]')
+        single = page.locator('input[autocomplete="one-time-code"]').or_(
+            page.get_by_label("Enter 6-digit OTP code", exact=True)
+        )
         singles = page.locator('input[maxlength="1"][inputmode="numeric"]')
         if await single.count() == 1 and await single.is_visible():
             return
@@ -224,7 +228,9 @@ async def _enter_otp(page: Page, otp: str) -> None:
     digits = validate_otp(otp)
     if urlparse(page.url).hostname != SINGPASS_HOST:
         raise RuntimeError("unexpected authentication page")
-    single = page.locator('input[autocomplete="one-time-code"]')
+    single = page.locator('input[autocomplete="one-time-code"]').or_(
+        page.get_by_label("Enter 6-digit OTP code", exact=True)
+    )
     if await single.count() == 1 and await single.is_visible():
         await single.fill(digits)
         return
