@@ -6,9 +6,13 @@ agent:
   inspect_db_size: -1
   web_addr: false
 # Cloud Full Capture is separate: keep it OFF in the ngrok dashboard.
-# ngrok terminates TLS and can access OTP traffic; local settings do not prevent that.
+# The assigned domain forwards to the loopback Mini App gateway on 8766; its exact
+# /otp and /otp/pending routes proxy to the independent OTP receiver on 8765.
+# No arbitrary proxy target or path is exposed by the gateway.
+# ngrok terminates TLS and can access Mini App and proxied OTP traffic;
+# local settings do not prevent that.
 endpoints:
-  - name: otp
+  - name: attendance
     url: https://YOUR-ASSIGNED.ngrok-free.app
     upstream:
-      url: http://127.0.0.1:8765
+      url: http://127.0.0.1:8766

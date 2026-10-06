@@ -8,19 +8,64 @@ import logging
 import signal
 import sys
 from dataclasses import replace
+from datetime import datetime
 
 from .attendance import (
+    DEPARTMENT,
     Answers,
     DayType,
     build_answers,
     choose_day_type,
     validate_answers,
 )
-from .config import load_config
-from .otp import CliOtpProvider, OtpProvider, validate_otp_token
-from .runner import AttendanceRunner, BusyRun, DuplicateRun
+from .config import Config, load_config
+from .otp import CliOtpProvider, OtpProvider, read_terminal_line, validate_otp_token
+from .runner import AttendanceRunner, BusyRun, DuplicateRun, answer_hash
 from .server import OtpHttpServer
-from .storage import StateStore
+from .storage import SINGAPORE, AdditionalSubmissionConsent, StateStore
+
+
+async def _review_additional_submission(
+    runner: AttendanceRunner,
+    store: StateStore,
+    cfg: Config,
+    answers: Answers,
+    attendance_name: str,
+) -> AdditionalSubmissionConsent | None:
+    """Show prior attempts, fresh source evidence and answers; authorise one attempt."""
+    day = datetime.now(SINGAPORE).date()
+    check = await runner.records.lookup(attendance_name, DEPARTMENT, day, fresh=True)
+    if check.status == "unavailable" or check.digest is None:
+        print(
+            f"External attendance source unavailable ({check.error_code}); nothing was submitted.",
+            file=sys.stderr,
+        )
+        return None
+    prior = store.submission_attempts(cfg.singpass_id, cfg.form_url, day)
+    print(f"Prior local attempts for {day.isoformat()}:")
+    for row in prior:
+        print(f"  #{row['id']} {row['status']} {row['detail']}".rstrip())
+    if not prior:
+        print("  none")
+    print(f"Source check: {check.status} at {check.checked_at.isoformat()}")
+    for record in check.records:
+        print(f"  {record.timestamp.isoformat()} {record.status}")
+    print("Answers to submit:")
+    for question, value in answers.items():
+        print(f"  {question}: {value}")
+    typed = await read_terminal_line(
+        "Type yes to authorise exactly one additional submission: ", cfg.prompt_timeout
+    )
+    if typed.strip().lower() != "yes":
+        return None
+    return store.authorize_cli_consent(
+        cfg.singpass_id,
+        cfg.form_url,
+        day,
+        answer_hash=answer_hash(answers),
+        records_digest=check.digest,
+        local_attempt_ids=[row["id"] for row in prior],
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -47,9 +92,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--state-dir", help="shared persistent state directory")
     parser.add_argument(
+        "--attendance-name",
+        help="MyInfo name exactly as it appears in the form, in ALL CAPS; prompted if absent",
+    )
+    parser.add_argument(
         "--override",
         action="store_true",
-        help="intentionally permit a duplicate submission; check prior outcomes first",
+        help=(
+            "open an explicit additional-submission review (prior attempts, fresh source "
+            "evidence and answers, typed confirmation) before resubmitting"
+        ),
     )
     return parser.parse_args()
 
@@ -93,6 +145,7 @@ async def amain(args: argparse.Namespace) -> int:
         if args.override and (cfg.preflight or cfg.discover or cfg.dry_run):
             print("--override is only valid for an intentional submission.", file=sys.stderr)
             return 2
+        submission = not (cfg.preflight or cfg.discover or cfg.dry_run)
         otp_provider: OtpProvider = CliOtpProvider()
         if cfg.otp_http_enabled and not cfg.preflight:
             validate_otp_token(cfg.otp_http_token)
@@ -102,6 +155,21 @@ async def amain(args: argparse.Namespace) -> int:
                 "cli", None if getattr(args, "http_otp", False) else otp_provider
             )
             print("OTP receiver ready; phone delivery uses authenticated /otp/pending and /otp POST.")
+        attendance_name = getattr(args, "attendance_name", None)
+        if submission and attendance_name is None:
+            async with asyncio.timeout(cfg.prompt_timeout):
+                attendance_name = await read_terminal_line(
+                    "Enter your full name in ALL CAPS, exactly as it appears in the attendance "
+                    "form's MyInfo name field: ",
+                    cfg.prompt_timeout,
+                )
+            attendance_name = attendance_name.strip()
+        if submission and not attendance_name:
+            print(
+                "An uppercase MyInfo attendance name is required before a submission.",
+                file=sys.stderr,
+            )
+            return 2
         answers: Answers = {}
         if not cfg.preflight and not cfg.discover:
             async with asyncio.timeout(cfg.prompt_timeout):
@@ -110,7 +178,33 @@ async def amain(args: argparse.Namespace) -> int:
                 validate_answers(answers)
         store = StateStore(cfg.state_dir, cfg.retention_days)
         runner = AttendanceRunner(cfg, store)
-        result = await runner.run(cfg, otp_provider, answers, override=args.override)
+        consent = None
+        if args.override:
+            assert attendance_name is not None
+            consent = await _review_additional_submission(
+                runner, store, cfg, answers, attendance_name
+            )
+            if consent is None:
+                print("No additional submission was authorised.", file=sys.stderr)
+                return 1
+        result = await runner.run(
+            cfg,
+            otp_provider,
+            answers,
+            attendance_name=attendance_name,
+            department=DEPARTMENT if submission else None,
+            consent=consent,
+        )
+        if result.status == "recorded":
+            detail = f" {result.detail}." if result.detail else ""
+            print(
+                "Attendance is already recorded at the source; no submission was made."
+                f"{detail}"
+            )
+            return 0
+        if result.status == "blocked":
+            print(f"No submission was made: {result.detail}.", file=sys.stderr)
+            return 1
         if result.status == "unknown":
             print(
                 "UNKNOWN: submission may have reached FormSG. Check the form outcome manually; "
@@ -146,8 +240,8 @@ async def amain(args: argparse.Namespace) -> int:
         return 1
     except DuplicateRun:
         print(
-            "Duplicate submission blocked. Check the prior outcome; use --override only for an "
-            "intentional resubmission.",
+            "Duplicate submission blocked or reviewed evidence changed. Check the prior outcome; "
+            "use --override to open a fresh additional-submission review.",
             file=sys.stderr,
         )
         return 1

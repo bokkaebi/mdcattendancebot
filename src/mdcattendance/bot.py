@@ -1,6 +1,7 @@
 """Sandboxed Singpass/FormSG execution with fail-closed submission.
 
-Password selectors and FormSG submit/confirmation names come from captured DOM.
+Password selectors and the FormSG confirmation text come from captured DOM.
+Form submission uses legacy partial button-name matching, then a submit-type fallback.
 OTP input labels include user-reported DOM; other controls remain inferred.
 Accept only explicit OTP controls, never arbitrary textboxes or keyboard fallback.
 Discovery is explicit and restricted.
@@ -22,6 +23,7 @@ from playwright.async_api import (
     async_playwright,
     expect,
 )
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .attendance import Answers, validate_answers
 from .config import Config
@@ -43,6 +45,12 @@ async def _wait_url_contains(page: Page, fragment: str, *, timeout_ms: int) -> N
     await page.wait_for_url(lambda url: urlparse(str(url)).hostname == fragment, timeout=timeout_ms)
 
 
+def _emit_stage(on_stage: Callable[[str], None] | None, name: str) -> None:
+    """Report a truthful coarse stage; never any credential, OTP or phone data."""
+    if on_stage is not None:
+        on_stage(name)
+
+
 # --------------------------------------------------------------------------- #
 # public entry
 # --------------------------------------------------------------------------- #
@@ -54,6 +62,7 @@ async def run_flow(
     answers: Answers,
     *,
     before_submit: Callable[[], Awaitable[None]] | None = None,
+    on_stage: Callable[[str], None] | None = None,
 ) -> str:
     if not cfg.preflight and not cfg.discover:
         validate_answers(answers)
@@ -82,9 +91,11 @@ async def run_flow(
             if cfg.preflight:
                 await _preflight(page, cfg)
                 return "preflight"
-            await _login_with_singpass(page, cfg, otp)
+            _emit_stage(on_stage, "login")
+            await _login_with_singpass(page, cfg, otp, on_stage)
             await _consent_agree(page, cfg)
             await _back_to_form(page, cfg)
+            _emit_stage(on_stage, "form")
             if cfg.discover:
                 await discover_form(page, _diagnostic_path(cfg))
                 return "discovered"
@@ -95,6 +106,8 @@ async def run_flow(
             if before_submit is None:
                 raise RuntimeError("submission requires a durable before_submit callback")
             await before_submit()
+            # Only after the runner persisted "submitting" may the click stage begin.
+            _emit_stage(on_stage, "submitting")
             await _submit_form(page)
             await _confirm_end_page(page)
             log.info("attendance confirmation observed")
@@ -188,7 +201,12 @@ async def _preflight(page: Page, cfg: Config) -> None:
     )
 
 
-async def _login_with_singpass(page: Page, cfg: Config, otp: OtpProvider) -> None:
+async def _login_with_singpass(
+    page: Page,
+    cfg: Config,
+    otp: OtpProvider,
+    on_stage: Callable[[str], None] | None = None,
+) -> None:
     await _goto_singpass(page, cfg.navigation_timeout_ms)
     await _click_use_password(page)
     log.info("entering Singpass credentials")
@@ -200,6 +218,7 @@ async def _login_with_singpass(page: Page, cfg: Config, otp: OtpProvider) -> Non
     log.info("credentials submitted; waiting for OTP page")
     await _wait_for_otp_page(page, timeout_ms=60000)
     log.info("OTP page ready; waiting for OTP delivery")
+    _emit_stage(on_stage, "otp")
     code = validate_otp(await otp.wait_for_otp(timeout=cfg.otp_timeout))
     log.info("OTP received; entering it")
     await _enter_otp(page, code)
@@ -284,11 +303,18 @@ async def _back_to_form(page: Page, cfg: Config) -> None:
 
 
 async def _submit_form(page: Page) -> None:
-    # VERIFIED: form-aria-snapshot.yaml accessible name.
-    button = page.get_by_role("button", name="End of form. Submit now", exact=True)
-    await expect(button).to_be_visible()
-    await expect(button).to_be_enabled()
-    await button.click()
+    for name in ("Submit", "Submit form", "Proceed", "Confirm"):
+        button = page.get_by_role("button", name=name)
+        if await button.count():
+            await button.first.click()
+            log.info("clicked '%s'", name)
+            return
+    button = page.locator('button[type="submit"]')
+    if await button.count():
+        await button.first.click()
+        log.info("clicked submit button")
+        return
+    raise PlaywrightTimeoutError("could not find the form submit button")
 
 
 async def _confirm_end_page(page: Page) -> None:

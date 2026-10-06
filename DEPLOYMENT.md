@@ -4,7 +4,10 @@ Supported target: Ubuntu 24.04 LTS, Python 3.12 and Playwright's bundled Chromiu
 Use one virtual environment, one unprivileged bot service and Telegram long
 polling. No inbound firewall port, desktop, Xvfb, VNC or browser pool is needed.
 HTTP OTP is off by default; optional phone forwarding uses an authenticated
-loopback receiver and an outbound ngrok tunnel. Outbound HTTPS to Telegram,
+loopback receiver and an outbound ngrok tunnel. The optional Telegram Mini App
+planner is served in the same bot process on `127.0.0.1:8766`; the assigned HTTPS
+domain forwards to that gateway, and only its exact `/otp` and `/otp/pending`
+routes proxy to the receiver on 8765. Outbound HTTPS to Telegram,
 Singpass and FormSG must work. Scheduling is
 **assisted submission**, not unattended attendance: remain available for OTP and
 MC clinic/timing prompts. Times use `Asia/Singapore`; the attendance form requires
@@ -48,7 +51,11 @@ Edit `/etc/mdcattendance/env` with `sudoedit`; retain ownership and mode 0600.
 Set the bot token, `STATE_DIR=/var/lib/mdcattendance`,
 `TELEGRAM_USERS_PATH=/etc/mdcattendance/users.json`, `HEADLESS=true`,
 `ATTENDANCE_DEADLINE=09:00`, `RUN_TIMEOUT=600`, `OTP_TIMEOUT=180`,
-`RETENTION_DAYS=90` and `DIAGNOSTIC_TTL_HOURS=24`. Leave
+`RETENTION_DAYS=90` and `DIAGNOSTIC_TTL_HOURS=24`. Set `MINIAPP_PUBLIC_URL` to the
+bare assigned HTTPS origin (no path, query, fragment or credentials) to enable the
+Mini App planner; leave it blank to keep the planner off. `MINIAPP_PORT=8766` is the
+loopback gateway bound only on `127.0.0.1`; the OTP receiver keeps its own
+`OTP_HTTP_ENABLED`/`OTP_HTTP_PORT=8765` settings. Leave
 `CHROMIUM_EXECUTABLE_PATH` unset to use the bundled browser. CLI authenticated
 runs additionally need `SINGPASS_ID` and `SINGPASS_PASSWORD` in this restricted
 file. Telegram uses the private users file instead.
@@ -102,15 +109,22 @@ screenshots. Each token must be unique, 32–128 ASCII URL-safe characters
    only in the ngrok config; it is not a receiver bearer token or Telegram bot token.
 
 Set `OTP_HTTP_ENABLED=true` and `OTP_HTTP_PORT=8765` in
-`/etc/mdcattendance/env`, then restart the bot. Telegram starts the receiver only
-if enabled and at least one owner has a token. CLI env enablement races terminal
+`/etc/mdcattendance/env`, then restart the bot. `OTP_HTTP_ENABLED` alone starts
+the loopback receiver: Telegram starts it even before any owner has a token, and
+the restricted users file is re-read on every request, so owners provisioned or
+rotated later are picked up without another restart. An owner whose token is
+blank/omitted stays manual and gets `401` for phone bearer requests while the
+receiver keeps serving every other owner. `OTP_HTTP_TOKEN` is the CLI-only
+bearer: Telegram ignores it, it never gates or disables the Telegram receiver,
+and setting it does not change owner behavior. CLI env enablement races terminal
 and HTTP OTP; `--http-otp` enables HTTP-only OTP, with profile/MC prompts still in
 the terminal. For example, append `--http-otp` to the target dry-run command below.
 Preflight neither binds nor checks this receiver/token.
 
 The bot and a simultaneous CLI receiver cannot bind the same port. Prefer stopping
-the bot for CLI gates. If both must be running, override CLI `OTP_HTTP_PORT=8766`
-in its invocation and deliberately point the phone/tunnel at that receiver's port;
+the bot for CLI gates. If both must be running, override CLI `OTP_HTTP_PORT=8767`
+(or another free loopback port — never 8765 or the 8766 Mini App gateway) in its
+invocation and deliberately point the phone/tunnel at that receiver's port;
 the CLI needs its own token. This does not bypass the shared one-browser process lock.
 
 ### Install and configure the optional tunnel
@@ -138,13 +152,15 @@ sudoedit /etc/mdcattendance/ngrok.yml
 
 Replace `agent.authtoken` with the account's agent secret and the endpoint `url`
 with `https://YOUR-ASSIGNED.ngrok-free.app` using your actual assigned domain.
-Retain version 3, endpoint name `otp`, and upstream `http://127.0.0.1:8765`
-(match the receiver port). Retain `agent.inspect_db_size: -1` and
+Retain version 3, endpoint name `attendance`, and upstream
+`http://127.0.0.1:8766` (the Mini App gateway; the OTP receiver on 8765 is reached
+only through the gateway's exact proxied routes). Retain `agent.inspect_db_size: -1` and
 `agent.web_addr: false` to disable local traffic storage and inspection UI.
 Separately keep cloud **Full Capture OFF** in the ngrok dashboard: local settings
-do not disable cloud Full Capture. ngrok terminates TLS and can access OTP data;
-use this provider only if you accept that trust boundary. Do not enable capture,
-request dumps or verbose request logging on the phone either.
+do not disable cloud Full Capture. ngrok terminates TLS and can access Mini App
+traffic and the proxied OTP routes; use this provider only if you accept that trust
+boundary. Do not enable capture, request dumps or verbose request logging on the
+phone either.
 
 ```sh
 sudo -u mdcattendance /usr/local/bin/ngrok config check --config /etc/mdcattendance/ngrok.yml
@@ -156,11 +172,33 @@ sudo systemctl start mdcattendance-ngrok.service
 Start the configured bot manually for the dry-run gate; only enable either service
 at boot after the target gates pass (`sudo systemctl enable --now
 mdcattendance-ngrok.service` for the optional tunnel). The tunnel unit uses the same unprivileged
-user and `ngrok start otp --config /etc/mdcattendance/ngrok.yml`. Neither service
+user and `ngrok start attendance --config /etc/mdcattendance/ngrok.yml`. Neither service
 starts or requires the other: starting the tunnel for a CLI gate does not start
 the bot/scheduler, and manual OTP still works when ngrok is down. Ordering only
 places the tunnel after the bot when both are independently started.
 No application download or automatic tunnel activation occurs.
+
+### Public gateway routes and auth
+
+The assigned domain reaches the loopback gateway, which serves the Mini App and,
+for the two exact paths `/otp` and `/otp/pending`, forwards a bounded method, body
+and `Authorization` header to the independent `127.0.0.1:8765` receiver. It exposes
+no arbitrary proxy target or path and performs no auth translation; those routes
+keep the owner bearer contract below. Every other path is Mini App traffic.
+The gateway binds only when `MINIAPP_PUBLIC_URL` is set: with it blank nothing
+listens on 8766 and tunneled phone OTP is unavailable, though manual OTP and the
+CLI/`/attend` paths still work. The gateway never enables or starts the receiver
+— that stays governed solely by `OTP_HTTP_ENABLED`. When the separate receiver is
+off, its exact `/otp` and `/otp/pending` routes return `503` unavailable instead
+of proxying or falling back to manual.
+
+Mini App API requests must carry the Telegram `initData` the app was launched with
+in `Authorization: tma ...`. The server validates its HMAC with the bot token using
+a constant-time comparison, requires an `auth_date` no more than 30 seconds in the
+future and at most 60 minutes old, reloads the allowlist, and derives the owner id only from
+the verified payload. Invalid or expired requests get `401`; non-allowlisted get
+`403`. Tokens, `initData` and other secrets must never appear in URLs, access logs or
+error bodies, and personal responses are `no-store`.
 
 The [free-plan limits](https://ngrok.com/docs/pricing-limits/free-plan-limits)
 provide one assigned stable dev domain with HTTPS, 20,000 HTTP requests/month,
@@ -222,7 +260,22 @@ receiver is unavailable) to return to manual operation.
 
 Stop the service while performing CLI gates; CLI and scheduler share a process
 lock, permitting only one active browser run. These invocations use exactly the
-same user, environment and bundled browser as the service:
+same user, environment and bundled browser as the service.
+
+First verify the worksheet name/gid association. This imports only
+`mdcattendance.records`, whose sheet/gid are fixed module constants read over an
+anonymous HTTP request: no restricted env file (`MDCATTENDANCE_ENV_FILE`), no
+`.env`, no credentials and no particular working directory are involved. Run it
+as the service user with the already-synced venv interpreter — not `uv run`,
+which would re-resolve and sync:
+
+```sh
+sudo -u mdcattendance /opt/mdcattendance/.venv/bin/python -c 'import asyncio; from mdcattendance.records import SubmissionRecords; asyncio.run(SubmissionRecords().verify_source()); print("Viewable/gid verified")'
+```
+
+On `source_mismatch` (or any other failure), fix the source or the configured
+spreadsheet id/gid; never select a different tab. Only then run the gate
+invocations:
 
 ```sh
 sudo systemctl stop mdcattendance.service 2>/dev/null || true
@@ -232,8 +285,12 @@ sudo -u mdcattendance env MDCATTENDANCE_ENV_FILE=/etc/mdcattendance/env PLAYWRIG
 
 Preflight must pass without credentials. Dry-run must really authenticate, accept
 an operator-provided OTP, fill and read back the selected profile, and exit
-without clicking Submit. Repeat dry-run for the profiles you will actually use,
-including WFH and MC; MC collects clinic/timing interactively. Observe that no
+without clicking Submit. Repeat dry-run for the profiles you will actually use:
+Present (IS) (`--day-type normal`) and WFH. MA branches can be gated only after
+the authenticated form capture has recorded and verified every answer label,
+conditional ordering and AM/PM/other-half status; until then automatic MA stays
+blocked and is never enabled. MC remains a manual, interactive path (clinic and
+timing prompts), not part of the planner. Observe that no
 Chromium child survives normal completion, timeout or cancellation. If Singpass
 rejects the VPS or selectors change, stop here and investigate; do not add stealth
 flags, guessed selectors, `--no-sandbox`, or blind retries.
@@ -252,18 +309,55 @@ and the real FormSG confirmation. This is not permission to submit while
 installing:
 
 ```sh
-sudo -u mdcattendance env MDCATTENDANCE_ENV_FILE=/etc/mdcattendance/env PLAYWRIGHT_BROWSERS_PATH=/opt/mdcattendance/browsers /opt/mdcattendance/.venv/bin/mdcattendance --day-type normal
+sudo -u mdcattendance env MDCATTENDANCE_ENV_FILE=/etc/mdcattendance/env PLAYWRIGHT_BROWSERS_PATH=/opt/mdcattendance/browsers /opt/mdcattendance/.venv/bin/mdcattendance --day-type normal --attendance-name 'YOUR NAME IN ALL CAPS'
 ```
+
+`--attendance-name` must be your full name in ALL CAPS exactly as it appears in the
+form's MyInfo name field; it is prompted when omitted, and is required only for real
+submissions. The runner re-checks the public Viewable worksheet for that name,
+your provisioned department and today's date before login and again immediately before
+the Submit click: an unavailable source blocks the run, and an existing same-day record
+suppresses the attempt and is reported as already recorded.
 
 A submission is not exactly-once: FormSG offers no transactional idempotency
 contract. The durable journal records `submitting` before the click. Interrupted
 or unconfirmed submission becomes `unknown`, never an automatic retry. Known
-pre-submit failures become `failed`. Ordinary repeats for the same account,
-form/date are blocked for confirmed or uncertain attempts. Check actual form
-records before deciding whether to intentionally resubmit; CLI `--override` or
-Telegram `/attend override` is an explicit exceptional action, not a recovery
-setting. Scheduler never overrides. Nonconfirmed actual CLI submissions exit
+pre-submit failures become `failed` and stay stopped until an explicit owner retry;
+Mini App **Retry submission** requires fresh source checks and a new OTP.
+Ordinary repeats for the same account, form/date are blocked for confirmed or uncertain attempts.
+Check actual form records before deciding whether to intentionally resubmit; CLI `--override` or
+Telegram `/attend override` opens an explicit review (journalled attempts, fresh
+source evidence, exact answers, typed confirmation) and authorises one additional
+attempt only — it is not a recovery setting or a silent bypass. Scheduler never
+overrides. Nonconfirmed actual CLI submissions exit
 nonzero. Restarting or editing a schedule does not replay completed/unknown work.
+
+### Production gates before enabling schedules
+
+Local loopback/Playwright smoke and a successful local dry-run are **not** live
+acceptance. Enabling schedules (and enabling either service at boot) requires all of
+the following on the actual target, and this document does not claim any of them has
+passed:
+
+- The assigned HTTPS domain launches the Mini App from real Telegram Android, iOS
+  and Desktop clients, including the menu button and `#today`/`#plan`/`#settings`
+  deep links and the Today/Plan/Settings flows.
+- VPS authenticated dry-runs pass for Present (IS) and WFH, and for every MA branch
+  — but only after its authenticated form capture is complete; until then MA stays
+  blocked and no MA branch is claimed verified.
+- A real phone OTP is delivered over the tunnel, and the 60-second manual-fallback
+  warning appears when delivery does not arrive.
+- **Open blocker (stop before automatic schedules).** `Scheduler.otp_ready` still
+  requires the CLI-only `OTP_HTTP_TOKEN` in addition to an enabled receiver and
+  the owner's token, so Telegram per-owner HTTP OTP cannot enable automatic mode
+  on its own. Leave automatic schedules off until this is fixed; setting a CLI
+  token merely to satisfy the check is not a workaround.
+- **Open blocker (stop before automatic schedules).** A decision-less CLI/`/attend`
+  run does not retain prior positive source evidence when a later export omits the
+  row, so its duplicate guard is not durable. Do not treat it as repeat-safe; keep
+  automatic schedules off until this is fixed.
+- The operator records acceptance of those results before `systemctl enable` and
+  before any automatic schedule runs.
 
 ## Service, scheduling and shutdown
 
@@ -281,12 +375,29 @@ Exercise a private-chat `/dry_run` under this unit before enabling boot. Then:
 sudo systemctl enable mdcattendance.service
 ```
 
-Use `/start`, `/schedule`, and `/time` to select days/status and an earlier time.
-Use `/attend` for manual attendance, `/dry_run` for no-submit rehearsal and
-`/cancel` to cancel pending/active interaction. Schedules must be strictly before
-the deadline. Busy scheduled work can defer only within that window; missed or
-skipped work is notified, not silently retried after the deadline. Keep the bot
-running and be available at the selected time for OTP/MC details.
+Use `/name` to enter and confirm your ALL-CAPS MyInfo name, then `/schedule` and
+`/time` (or the `Open Planner` menu button and the inline `Open Today` button) to
+open the Mini App Today/Plan/Settings views; plans cover the next 14 Singapore dates with no
+auto-fill of new horizon dates, and enabling auto mode requires accepting that
+silence executes the saved plan. Use `/attend` for manual attendance, `/dry_run`
+for no-submit rehearsal and `/cancel` to cancel your pending interaction or queued/running
+scheduled work, including login before an OTP prompt exists. After `submitting` begins,
+cancellation cannot promise that no entry was created; preserve an uncertain outcome.
+Schedules must be strictly before the deadline. Busy scheduled work can defer only
+within that window; missed or skipped work is notified, not silently retried after
+the deadline. Keep the bot running and be available at the selected time for
+OTP/MC details.
+
+The scheduler has one morning decision prompt and one logical reminder shortly
+before the auto time per owner/day. Delivery is recorded only after Telegram
+returns a message ID; failed sends retry while eligible, never after the attendance
+deadline. Only the latest delivered prompt/reminder owns the live buttons; older
+keyboards are stale. A user-edit pause holds automatic fallback until an explicit
+save or restore; disabled auto mode keeps a complete plan held. On restart or
+midnight rollover, prior-day awaiting/ready decisions and verification holds become
+`missed`, with one notification attempt. Deliberate user holds and terminal outcomes
+are preserved. Interrupted prepared/running attempts become `failed`; interrupted
+`submitting` attempts become `unknown`. Neither is automatically replayed.
 
 SIGTERM cancels active work and closes browser resources. `KillMode=mixed` gives
 the main process a 45-second graceful stop, then kills any remaining processes
@@ -302,7 +413,8 @@ has no guessed memory cap and allows tasks until a measured cap is installed.
 Measure the **whole service cgroup** on the actual VPS, including browser children.
 For separate login, OTP-wait and fill observations, run a private-chat dry-run
 and sample continuously in a second terminal; record phase start/end wall times
-as you watch the run (never OTP values). Repeat for Normal/WFH/MC and cancellation.
+as you watch the run (never OTP values). Repeat for Present (IS)/WFH and, once its
+authenticated capture is complete, each MA branch, plus cancellation.
 
 ```sh
 sudo sh -c 'CG=$(systemctl show --property=ControlGroup --value mdcattendance.service); while :; do date -Is; cat "/sys/fs/cgroup$CG/memory.current" "/sys/fs/cgroup$CG/memory.peak" "/sys/fs/cgroup$CG/pids.current" "/sys/fs/cgroup$CG/pids.peak"; sleep 1; done'
@@ -376,15 +488,30 @@ Copying a diagnostic elsewhere loses automatic expiry: chmod it 0600, restrict
 its parent directory and explicitly delete it within the same TTL. Never attach
 authenticated pages or credentials to bug reports.
 
-## Clean JSON-to-SQLite schedule cutover
+## Idempotent SQLite planner migration
 
-There is no JSON compatibility reader or HTTP OTP migration shim. Stop the old
-bot first. Keep its `schedules.json` as a restricted offline reference only; the
-new bot ignores it. Provision the private users file locally, then recreate only
-the desired schedules via `/schedule` and `/time` in private chats. Validate each
-day/status and move times before 09:00. This is a deliberate operator migration,
-not import of old dispatch/completion state. SQLite in `STATE_DIR` is now the
-only source of schedules, dispatch journal and attempt outcomes. Preserve that
-DB through upgrades; changing schedules does not clear its attempt history.
-Disable/remove old webhook/OTP forwarding services and inbound firewall openings.
-Never run the old bot alongside the new one, even during migration.
+There is no JSON compatibility reader, calendar execution path or HTTP OTP
+migration shim. Stop the old bot first, then start the new one once. On startup
+`StateStore` performs an idempotent schema upgrade in a transaction under the
+existing process lock; it is safe to rerun after an interrupted upgrade. It adds
+the planner tables (`attendance_settings`, `attendance_plans`, `daily_decisions`,
+`attendance_observations`) and imports future legacy `schedule_days` rows whose
+status is `normal`, `wfh` or `none` into plans, where `normal`/`wfh` keep their
+profile and `none` becomes an explicit `skip`. Legacy `schedule_days` rows with any
+other status (MC and the rest) are preserved as immutable history and are never
+silently enabled in the new planner; MC remains the existing manual CLI/Telegram
+path.
+
+A legacy `schedules.time` becomes `auto_time` only when it is later than 08:00 and
+earlier than the configured deadline; otherwise 08:30 is kept and the settings are
+flagged for review. Every migrated owner starts with auto mode **disabled** until
+they confirm their All-CAPS MyInfo name and review the auto-fallback policy in the
+Mini App Settings. Current-date dispatch outcomes are imported so an already
+started/completed run cannot be replayed; the legacy journal and dispatch tables
+are retained unchanged as immutable historical evidence.
+
+Preserve the SQLite DB through upgrades and keep restricted backups of it; changing
+a plan does not clear attempt history. Do not drop or hand-edit the legacy tables to
+clear a block. Disable/remove old webhook/OTP forwarding services and inbound
+firewall openings, and never run the old bot alongside the new one, even during
+migration.

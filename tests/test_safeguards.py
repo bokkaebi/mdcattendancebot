@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import unittest
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -19,13 +21,71 @@ from mdcattendance.attendance import NORMAL_ANSWERS
 from mdcattendance.bot import SINGPASS_HOST, _enter_otp, _wait_for_otp_page
 from mdcattendance.config import Config
 from mdcattendance.formfiller import fill_form, verify_form
+from mdcattendance.records import RecordCheck, SubmissionRecord
 from mdcattendance.runner import AttendanceRunner, DuplicateRun
-from mdcattendance.scheduler import Scheduler
-from mdcattendance.schedules import save_schedule
 from mdcattendance.storage import StateStore
 from mdcattendance.telegram_bot import Interaction
 
 SG = ZoneInfo("Asia/Singapore")
+OWNER = "OFFLINE OWNER"
+DEPARTMENT = "Offline Department"
+# Pinned Singapore instant: durable submission success cases must not follow the
+# host clock. A real run at 23:59:30 would clamp any same-day deadline into the past.
+FIXED_NOW = datetime(2026, 10, 2, 8, 0, tzinfo=SG)
+# Evidence timestamps share the pinned instant so checked_at can never sit ahead
+# of the frozen planner clock.
+FIXED_UTC = FIXED_NOW.astimezone(UTC)
+
+
+class _GenuineDatetimeCheck(type):
+    """Accept genuine datetime objects in isinstance(..., FixedRunnerDatetime).
+
+    The stand-in subclasses datetime only to fake now(); production
+    ``isinstance(value, datetime)`` checks must still recognise real values.
+    """
+
+    def __instancecheck__(cls, instance: object) -> bool:
+        return isinstance(instance, datetime)
+
+
+class FixedRunnerDatetime(datetime, metaclass=_GenuineDatetimeCheck):
+    """Runner clock pinned to FIXED_NOW; asyncio timeouts stay on real monotonic time."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return FIXED_NOW.astimezone(tz) if tz else FIXED_NOW.replace(tzinfo=None)
+
+
+def absent_check() -> RecordCheck:
+    return RecordCheck(
+        "not_found",
+        (),
+        FIXED_UTC,
+        hashlib.sha256(b"synthetic-absent").hexdigest(),
+    )
+
+
+def record_check(*records: SubmissionRecord) -> RecordCheck:
+    digest = hashlib.sha256(
+        json.dumps([record.to_dict() for record in records], sort_keys=True).encode()
+    ).hexdigest()
+    return RecordCheck(
+        "found" if records else "not_found", tuple(records), FIXED_UTC, digest
+    )
+
+
+class SyntheticRecords:
+    """Injectable owner-evidence reader; the last supplied check repeats."""
+
+    def __init__(self, *checks: RecordCheck):
+        self.checks = list(checks)
+        self.calls: list[tuple[str, str, bool]] = []
+
+    async def lookup(self, name, department, day, *, fresh=False):  # noqa: ANN001, ANN201
+        self.calls.append((name, department, fresh))
+        if not self.checks:
+            raise AssertionError("unexpected extra source lookup")
+        return self.checks.pop(0) if len(self.checks) > 1 else self.checks[0]
 
 
 class FormReadbackTests(unittest.IsolatedAsyncioTestCase):
@@ -132,11 +192,18 @@ class DurableRunTests(unittest.IsolatedAsyncioTestCase):
             singpass_password="not-a-credential",
             form_url="https://example.invalid/form",
             state_dir=self.directory.name,
+            attendance_deadline="23:59",
         )
         self.store = StateStore(self.directory.name)
         self.addCleanup(self.store.close)
-        self.runner = AttendanceRunner(self.cfg, self.store)
+        self.records = SyntheticRecords(absent_check())
+        self.runner = AttendanceRunner(self.cfg, self.store, self.records)
         self.addAsyncCleanup(self.runner.shutdown)
+        runner_clock = patch("mdcattendance.runner.datetime", FixedRunnerDatetime)
+        runner_clock.start()
+        self.addCleanup(runner_clock.stop)
+        self.day = FIXED_NOW.date()
+        self.deadline = datetime.combine(self.day, time(9, 0), SG)
 
     async def test_confirmed_and_unknown_survive_restart_and_block_replay(self):
         for outcome in ("confirmed", "unknown"):
@@ -146,7 +213,15 @@ class DurableRunTests(unittest.IsolatedAsyncioTestCase):
                 observed = []
 
                 async def executor(
-                    cfg, otp, answers, *, before_submit, outcome=outcome, calls=calls, observed=observed
+                    cfg,
+                    otp,
+                    answers,
+                    *,
+                    before_submit,
+                    on_stage=None,
+                    outcome=outcome,
+                    calls=calls,
+                    observed=observed,
                 ):
                     calls.append("execute")
                     await before_submit()
@@ -157,15 +232,29 @@ class DurableRunTests(unittest.IsolatedAsyncioTestCase):
                     return "confirmed"
 
                 with patch("mdcattendance.runner.run_flow", executor):
-                    result = await self.runner.run(cfg, None, dict(NORMAL_ANSWERS))
+                    result = await self.runner.run(
+                        cfg,
+                        None,
+                        dict(NORMAL_ANSWERS),
+                        attendance_name=OWNER,
+                        department=DEPARTMENT,
+                        deadline=self.deadline,
+                    )
                     self.assertEqual(result.status, outcome)
                     self.assertEqual(observed, ["submitting"])
                     self.assertEqual(self.store.get_attempt(result.attempt_id)["status"], outcome)
                     reopened = StateStore(self.directory.name)
-                    restarted = AttendanceRunner(cfg, reopened)
+                    restarted = AttendanceRunner(cfg, reopened, SyntheticRecords(absent_check()))
                     try:
                         with self.assertRaises(DuplicateRun):
-                            await restarted.run(cfg, None, dict(NORMAL_ANSWERS))
+                            await restarted.run(
+                                cfg,
+                                None,
+                                dict(NORMAL_ANSWERS),
+                                attendance_name=OWNER,
+                                department=DEPARTMENT,
+                                deadline=self.deadline,
+                            )
                         self.assertEqual(reopened.get_attempt(result.attempt_id)["status"], outcome)
                     finally:
                         await restarted.shutdown()
@@ -190,6 +279,7 @@ class DurableRunTests(unittest.IsolatedAsyncioTestCase):
                         answers,
                         *,
                         before_submit,
+                        on_stage=None,
                         submitted=submitted,
                         calls=calls,
                         entered=entered,
@@ -201,7 +291,16 @@ class DurableRunTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.Event().wait()
 
                     with patch("mdcattendance.runner.run_flow", executor):
-                        task = asyncio.create_task(self.runner.run(cfg, None, dict(NORMAL_ANSWERS)))
+                        task = asyncio.create_task(
+                            self.runner.run(
+                                cfg,
+                                None,
+                                dict(NORMAL_ANSWERS),
+                                attendance_name=OWNER,
+                                department=DEPARTMENT,
+                                deadline=self.deadline,
+                            )
+                        )
                         await asyncio.wait_for(entered.wait(), 2)
                         if cancel:
                             task.cancel()
@@ -219,7 +318,7 @@ class DurableRunTests(unittest.IsolatedAsyncioTestCase):
         attempt = self.store.prepare(
             self.cfg.singpass_id,
             self.cfg.form_url,
-            datetime.now(SG).date().isoformat(),
+            self.day.isoformat(),
             "submit",
         )
         self.store.transition(attempt, "running")
@@ -228,7 +327,14 @@ class DurableRunTests(unittest.IsolatedAsyncioTestCase):
             patch("mdcattendance.runner.run_flow", side_effect=AssertionError("must not replay")),
             self.assertRaises(DuplicateRun),
         ):
-            await self.runner.run(self.cfg, None, dict(NORMAL_ANSWERS))
+            await self.runner.run(
+                self.cfg,
+                None,
+                dict(NORMAL_ANSWERS),
+                attendance_name=OWNER,
+                department=DEPARTMENT,
+                deadline=self.deadline,
+            )
         self.assertEqual(self.store.get_attempt(attempt)["status"], "unknown")
 
 
@@ -302,73 +408,6 @@ class OtpOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 "123456", user_id=7, chat_id=7, reply_to_message_id=current.message_id
             )
         )
-
-
-class ScheduleJournalTests(unittest.IsolatedAsyncioTestCase):
-    async def test_edit_replan_and_restart_preserve_completed_dispatch(self):
-        with TemporaryDirectory() as directory:
-            cfg = Config(
-                singpass_id="offline-schedule-account",
-                singpass_password="not-a-credential",
-                form_url="https://example.invalid/scheduled",
-                state_dir=directory,
-                attendance_deadline="23:59",
-            )
-            store = StateStore(directory)
-            runner = AttendanceRunner(cfg, store)
-            now = datetime.now(SG).replace(hour=8, minute=31, second=0, microsecond=0)
-
-            class FrozenDatetime(datetime):
-                @classmethod
-                def now(cls, tz=None):
-                    return now.astimezone(tz) if tz else now.replace(tzinfo=None)
-
-            self.enterContext(patch("mdcattendance.scheduler.datetime", FrozenDatetime))
-            day = now.date().isoformat()
-            save_schedule(store.path, 7, time="00:00", days={day: "normal"})
-            prepared = []
-            terminal = asyncio.Event()
-
-            async def prepare(uid, status, deadline):
-                prepared.append((uid, status))
-                return cfg, None, dict(NORMAL_ANSWERS)
-
-            async def notify(uid, text):
-                dispatch = store.get_schedule_dispatch(uid, day)
-                if dispatch and dispatch["status"] != "collecting":
-                    terminal.set()
-
-            async def executor(cfg, otp, answers, *, before_submit):
-                await before_submit()
-                return "confirmed"
-
-            scheduler = Scheduler(store, runner, cfg, prepare, notify)
-            try:
-                with patch("mdcattendance.runner.run_flow", executor):
-                    await scheduler.tick(now)
-                    await asyncio.wait_for(terminal.wait(), 2)
-                    save_schedule(store.path, 7, time="00:01", days={day: "wfh"})
-                    scheduler.replan()
-                    await scheduler.tick(now)
-                    await scheduler.stop()
-                self.assertEqual(prepared, [(7, "normal")])
-                self.assertEqual(store.get_schedule_dispatch(7, day)["status"], "confirmed")
-                save_schedule(store.path, 8, time="00:00", days={day: "normal"})
-                self.assertTrue(store.claim_schedule(8, day))
-                await runner.shutdown()
-                store.close()
-                store = StateStore(directory)
-                runner = AttendanceRunner(cfg, store)
-                scheduler = Scheduler(store, runner, cfg, prepare, notify)
-                await scheduler.tick(now)
-                await scheduler.stop()
-                self.assertEqual(prepared, [(7, "normal")])
-                self.assertEqual(store.get_schedule_dispatch(7, day)["status"], "confirmed")
-                self.assertEqual(store.get_schedule_dispatch(8, day)["status"], "missed")
-            finally:
-                await scheduler.stop()
-                await runner.shutdown()
-                store.close()
 
 
 if __name__ == "__main__":

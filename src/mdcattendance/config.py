@@ -7,7 +7,9 @@ import os
 import re
 import stat
 from dataclasses import dataclass, field
+from ipaddress import IPv6Address
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -50,6 +52,17 @@ class Config:
     otp_http_enabled: bool = False
     otp_http_port: int = 8765
     otp_http_token: str = field(default="", repr=False)
+    miniapp_public_url: str = ""
+    miniapp_port: int = 8766
+
+    @property
+    def miniapp_enabled(self) -> bool:
+        """The Mini App is served only when an operator-provisioned HTTPS origin exists."""
+        return bool(self.miniapp_public_url)
+
+    def miniapp_link(self, view: str = "") -> str:
+        """Deep link into a Mini App tab; the URL fragment never reaches the server path."""
+        return f"{self.miniapp_public_url}#{view.lstrip('#')}" if view else self.miniapp_public_url
 
     def __post_init__(self) -> None:
         for name in (
@@ -70,6 +83,63 @@ class Config:
             raise ValueError("otp_http_port must be between 0 and 65535")
         if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", self.attendance_deadline):
             raise ValueError("attendance_deadline must be HH:MM")
+        if (
+            not isinstance(self.miniapp_port, int)
+            or isinstance(self.miniapp_port, bool)
+            or not 0 <= self.miniapp_port <= 65535
+        ):
+            raise ValueError("miniapp_port must be between 0 and 65535")
+        if self.miniapp_public_url:
+            parsed = urlsplit(self.miniapp_public_url)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in ("", "/")
+            ):
+                raise ValueError(
+                    "miniapp_public_url must be an HTTPS origin without credentials, path, "
+                    "query or fragment"
+                )
+            try:
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError("miniapp_public_url has an invalid port") from exc
+            # The gateway serves the Mini App at its root only; keep just the origin so a
+            # stale base path can never point the Mini App at an unserved prefix. Match
+            # how a browser serializes the Origin header: lowercased IDNA hostname and
+            # no default :443, so the exact-match gateway check lines up. Bracketed IPv6
+            # is compressed to its canonical short form (what a browser serializes) and
+            # nondefault ports are preserved.
+            host = parsed.hostname
+            if ":" in host:
+                try:
+                    address = IPv6Address(host)
+                except ValueError as exc:
+                    raise ValueError("miniapp_public_url has an invalid host") from exc
+                if address.scope_id is not None:
+                    raise ValueError(
+                        "miniapp_public_url must not use an IPv6 zone identifier"
+                    )
+                mapped = address.ipv4_mapped
+                if mapped is not None:
+                    # IPv4-mapped IPv6 must use the browser's hex-tail form; the stdlib
+                    # keeps the dotted-quad tail, which no browser emits in an Origin.
+                    value = int(mapped)
+                    host = f"[::ffff:{value >> 16:x}:{value & 0xFFFF:x}]"
+                else:
+                    host = f"[{address.compressed}]"
+            else:
+                try:
+                    host = host.encode("idna").decode("ascii")
+                except UnicodeError as exc:
+                    raise ValueError("miniapp_public_url has an invalid host") from exc
+            origin = f"https://{host}" + (f":{port}" if port is not None and port != 443 else "")
+            if origin != self.miniapp_public_url:
+                object.__setattr__(self, "miniapp_public_url", origin)
         if not self.form_url or not self.state_dir or not self.users_path:
             raise ValueError("form_url, state_dir and users_path must not be blank")
         if sum((self.discover, self.preflight, self.dry_run)) > 1:
@@ -115,4 +185,6 @@ def load_config() -> Config:
         otp_http_enabled=_bool(os.getenv("OTP_HTTP_ENABLED")),
         otp_http_port=int(os.getenv("OTP_HTTP_PORT", "8765")),
         otp_http_token=os.getenv("OTP_HTTP_TOKEN", ""),
+        miniapp_public_url=os.getenv("MINIAPP_PUBLIC_URL", "").strip(),
+        miniapp_port=int(os.getenv("MINIAPP_PORT", "8766")),
     )

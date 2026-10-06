@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f2f4f7" />
+    <title>Attendance</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="app-header">
+      <h1 id="app-title">Attendance</h1>
+      <p class="sub" id="app-sub"></p>
+    </header>
+
+    <div id="error-banner" class="error-banner" hidden></div>
+
+    <main id="main" tabindex="-1">
+      <section id="view-today" class="view" aria-label="Today"></section>
+      <section id="view-plan" class="view" aria-label="Plan" hidden></section>
+      <section id="view-settings" class="view" aria-label="Settings" hidden></section>
+    </main>
+
+    <nav class="bottom-nav" aria-label="Sections">
+      <a id="nav-today" href="#today" data-view="today">Today</a>
+      <a id="nav-plan" href="#plan" data-view="plan">Plan</a>
+      <a id="nav-settings" href="#settings" data-view="settings">Settings</a>
+    </nav>
+
+    <div id="sheet-backdrop" class="sheet-backdrop" hidden></div>
+    <div
+      id="sheet"
+      class="sheet"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="sheet-title"
+      hidden
+    >
+      <div class="sheet-head">
+        <h2 id="sheet-title"></h2>
+        <button type="button" id="sheet-close" aria-label="Close">Close</button>
+      </div>
+      <div id="sheet-body"></div>
+    </div>
+
+    <div id="live" class="sr-only" role="status" aria-live="polite"></div>
+    <div id="alert" class="sr-only" role="alert" aria-live="assertive"></div>
+
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

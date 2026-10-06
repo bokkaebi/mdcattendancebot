@@ -1,0 +1,8 @@
+{
+  "hosts": {
+    "ovh": {
+      "host": "139.99.91.110",
+      "username": "ubuntu"
+    }
+  }
+}

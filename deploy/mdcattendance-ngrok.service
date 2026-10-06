@@ -1,5 +1,5 @@
 [Unit]
-Description=Optional ngrok tunnel for attendance HTTP OTP
+Description=Optional ngrok tunnel for the attendance Mini App gateway
 Wants=network-online.target
 After=network-online.target mdcattendance.service
 StartLimitIntervalSec=300
@@ -10,7 +10,7 @@ Type=simple
 User=mdcattendance
 Group=mdcattendance
 # Install the executable as administrator-owned; credentials stay in the restricted config.
-ExecStart=/usr/local/bin/ngrok start otp --config /etc/mdcattendance/ngrok.yml
+ExecStart=/usr/local/bin/ngrok start attendance --config /etc/mdcattendance/ngrok.yml
 Restart=on-failure
 RestartSec=10
 UMask=0077
